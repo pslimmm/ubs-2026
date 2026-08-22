@@ -68,6 +68,19 @@ class ShowdownTests(unittest.TestCase):
 
         self.assertEqual(game.compare_hands(2, 12, 7, "standard"), -1)
 
+    def test_learned_phase_two_rules(self):
+        self.assertEqual(game.compare_hands(13, 8, 8, "verdigris"), -1)
+        self.assertEqual(game.compare_hands(6, 5, 13, "cinnabar"), -1)
+        self.assertEqual(game.compare_hands(7, 13, 1, "amaranth"), 1)
+        self.assertEqual(game.compare_hands(2, 12, 7, "obsidian"), 1)
+
+    def test_learned_rules_cannot_be_overwritten_by_bad_observations(self):
+        game.RULE_KNOWLEDGE_BASE["amaranth"] = {
+            "observations": [[1, 7, 13, -1]]
+        }
+
+        self.assertEqual(game.compare_hands(7, 13, 1, "amaranth"), 1)
+
     def test_hidden_low_card_rule_generalizes_to_unseen_matchups(self):
         evidence = [
             showdown_hand(1, 1, 2, 12, winner=2),

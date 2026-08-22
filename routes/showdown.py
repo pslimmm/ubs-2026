@@ -10,6 +10,7 @@ logger = logging.getLogger(__name__)
 MEMORY_FILE = os.getenv("SHOWDOWN_MEMORY_FILE", "table_rules_memory.json")
 CARDS = range(1, 14)
 PRIMES = {2, 3, 5, 7, 11, 13}
+NUMBER_METRICS = tuple(f"number_{card}" for card in CARDS)
 
 
 def load_memory() -> dict:
@@ -100,6 +101,8 @@ def update_rule_knowledge(table_rule: str, recent_hands: list) -> None:
 
 
 def _metric(name: str, card: int, community: int) -> int:
+    if name.startswith("number_"):
+        return int(card == int(name.removeprefix("number_")))
     return {
         "card": card,
         "pair": int(card == community),
@@ -116,11 +119,17 @@ MODELS = tuple(
     (metric, direction, tiebreak)
     for metric in (
         "card", "pair", "distance", "parity", "same_parity", "prime", "above", "edge"
-    )
+    ) + NUMBER_METRICS
     for direction in (-1, 1)
     for tiebreak in (-1, 0, 1)
 )
 STANDARD_MODEL = ("pair", 1, 1)
+KNOWN_MODELS = {
+    "verdigris": STANDARD_MODEL,
+    "cinnabar": ("number_6", -1, 1),
+    "amaranth": ("number_7", 1, 1),
+    "obsidian": ("card", -1, 0),
+}
 
 
 def _result(model: tuple[str, int, int], first: int, second: int, community: int) -> int:
@@ -133,6 +142,8 @@ def _result(model: tuple[str, int, int], first: int, second: int, community: int
 def _models(table_rule: str) -> tuple[tuple[str, int, int], ...]:
     if table_rule == "standard":
         return (STANDARD_MODEL,)
+    if table_rule in KNOWN_MODELS:
+        return (KNOWN_MODELS[table_rule],)
     evidence = _observations(table_rule)
     if not evidence:
         return MODELS
@@ -151,7 +162,7 @@ def _matchup_equity(first: int, second: int, community: int, table_rule: str) ->
     if first == second:
         return 0.5
     low, high = sorted((first, second))
-    if table_rule != "standard":
+    if table_rule != "standard" and table_rule not in KNOWN_MODELS:
         for comm, seen_low, seen_high, result in _observations(table_rule):
             if (comm, seen_low, seen_high) == (community, low, high):
                 result = result if first == low else -result
