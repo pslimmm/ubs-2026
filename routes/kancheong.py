@@ -1,12 +1,15 @@
 import heapq
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 
 from flask import jsonify, request
 
 from routes import app
 
 logger = logging.getLogger(__name__)
+EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+INFINITY = Decimal("Infinity")
 
 
 @app.route('/kan-cheong-delivery-driver', methods=['POST'])
@@ -53,18 +56,18 @@ def solve_case(data):
 
         if curr_node == end:
             return {
-                "total_duration_sec": int(round(curr_time - time_sec)),
-                "arrival_time": parse_time(int(round(curr_time)), iso_to_sec=False),
+                "total_duration_sec": json_number(curr_time - time_sec),
+                "arrival_time": parse_time(curr_time, iso_to_sec=False),
                 "path": path,
             }
 
         if curr_time < dynamic_until:
-            label = (curr_node, round(curr_time, 9))
+            label = (curr_node, curr_time)
             if label in dynamic_labels:
                 continue
             dynamic_labels.add(label)
         else:
-            if static_best.get(curr_node, float("inf")) <= curr_time:
+            if static_best.get(curr_node, INFINITY) <= curr_time:
                 continue
             static_best[curr_node] = curr_time
 
@@ -117,7 +120,7 @@ def get_travel_time(edge_id, u, v, t_start, base_duration, obstructions):
                     {
                         "start": t_start_parsed,
                         "end": t_end_parsed,
-                        "speed_factor": obs["speed_factor"],
+                        "speed_factor": Decimal(str(obs["speed_factor"])),
                     }
                 )
 
@@ -128,10 +131,10 @@ def get_travel_time(edge_id, u, v, t_start, base_duration, obstructions):
                 for obs in matching_obs
                 if obs["start"] <= time < obs["end"]
             ),
-            default=1.0,
+            default=Decimal(1),
         )
 
-    if speed_factor_at(t_start) == 0.0:
+    if speed_factor_at(t_start) == 0:
         return None
     if base_duration == 0:
         return t_start
@@ -145,21 +148,21 @@ def get_travel_time(edge_id, u, v, t_start, base_duration, obstructions):
             transitions.add(obs["end"])
 
     T = sorted(list(transitions))
-    T.append(float("inf"))
+    T.append(INFINITY)
 
     # Simulate traversal using remaining base duration
-    remaining_duration = float(base_duration)
+    remaining_duration = Decimal(str(base_duration))
     curr_time = t_start
 
     for i in range(len(T) - 1):
         t_curr, t_next = T[i], T[i + 1]
         sf = speed_factor_at(t_curr)
 
-        if sf == 0.0:
+        if sf == 0:
             curr_time = t_next
             continue
 
-        if t_next == float("inf"):
+        if t_next == INFINITY:
             # We must finish in this final, obstruction-free interval
             return curr_time + remaining_duration / sf
 
@@ -177,17 +180,23 @@ def get_travel_time(edge_id, u, v, t_start, base_duration, obstructions):
 
 
 def parse_time(time, iso_to_sec=True):
-    if iso_to_sec:
-        try:
-            return int(datetime.fromisoformat(time).timestamp())
-        except:
-            return None
-    else:
-        try:
-            return (
-                datetime.fromtimestamp(time, tz=timezone.utc)
-                .isoformat()
-                .replace("+00:00", "Z")
-            )
-        except:
-            return None
+    try:
+        if iso_to_sec:
+            moment = datetime.fromisoformat(time)
+            if moment.tzinfo is None:
+                moment = moment.replace(tzinfo=timezone.utc)
+            delta = moment.astimezone(timezone.utc) - EPOCH
+            return Decimal(delta.days * 86400 + delta.seconds) + Decimal(
+                delta.microseconds
+            ) / Decimal(1_000_000)
+
+        microseconds = int((time * Decimal(1_000_000)).to_integral_value())
+        return (EPOCH + timedelta(microseconds=microseconds)).isoformat().replace(
+            "+00:00", "Z"
+        )
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def json_number(value):
+    return int(value) if value == value.to_integral_value() else float(value)
