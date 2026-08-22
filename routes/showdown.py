@@ -1,10 +1,18 @@
+import logging
 from flask import request, jsonify
 from routes import app
+
+
+logger = logging.getLogger(__name__)
 
 
 @app.route('/move', methods=['POST'])
 def showdown():
     data = request.get_json(silent=True) or {}
+    match_id = data.get("match_id") # type: ignore
+    logging.info("match id: %s\n", match_id)
+    table_rule = data.get("table_rule") # type: ignore
+    logging.info("table_rule: %s\n", table_rule)
 
     # Extract key parameters
     your_card : int | None = data.get("your_number")
