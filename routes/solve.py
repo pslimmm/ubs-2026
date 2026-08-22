@@ -47,12 +47,25 @@ def slo_output(heartbeats, query):
         return {"availability": 0, "p95LatencyMs": 0}
 
     latencies = sorted(heartbeat["latencyMs"] for heartbeat in matching)
-    p95_index = math.ceil(0.95 * len(latencies)) - 1
+    ok_count = sum(
+        heartbeat["status"].upper() == "OK" for heartbeat in matching
+    )
+    p95_position = math.ceil(0.95 * len(latencies))
+    p95_latency_ms = latencies[p95_position - 1]
+    logging.info(
+        "SLO calculation service=%s since=%s matching=%d ok=%d "
+        "sorted_latencies=%s p95_position=%d p95_latency_ms=%s",
+        query["service"],
+        query["since"],
+        len(matching),
+        ok_count,
+        latencies,
+        p95_position,
+        p95_latency_ms,
+    )
     return {
-        "availability": sum(
-            heartbeat["status"].upper() == "OK" for heartbeat in matching
-        ) / len(matching),
-        "p95LatencyMs": latencies[p95_index],
+        "availability": ok_count / len(matching),
+        "p95LatencyMs": p95_latency_ms,
     }
 
 
