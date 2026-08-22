@@ -205,6 +205,20 @@ def _secured(data: dict) -> bool:
     return isinstance(delta, (int, float)) and delta >= target + blind * remaining
 
 
+def _facing_reraise(data: dict) -> bool:
+    """Whether the opponent raised after our aggression in this round."""
+    our_seat = data.get("your_seat")
+    aggressive = False
+    for action in data.get("current_hand_actions", []):
+        if action.get("round") != data.get("round"):
+            continue
+        if action.get("seat") == our_seat:
+            aggressive |= action.get("action") in ("bet", "raise")
+        elif aggressive and action.get("action") == "raise":
+            return True
+    return False
+
+
 def _move(data: dict) -> dict:
     legal = data.get("legal_actions") or []
     if _secured(data):
@@ -216,6 +230,12 @@ def _move(data: dict) -> dict:
         data.get("your_number"), data.get("community_number"),
         data.get("table_rule", "standard"),
     )
+    if _facing_reraise(data):
+        if equity >= 0.90 and "call" in legal:
+            return {"action": "call"}
+        if "fold" in legal:
+            return {"action": "fold"}
+
     bounds = _amount_bounds(data)
     if equity > 0.70 and "raise" in legal and bounds:
         low, high = bounds

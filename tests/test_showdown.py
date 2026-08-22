@@ -170,6 +170,93 @@ class ShowdownTests(unittest.TestCase):
 
         self.assertEqual(response.get_json()["action"], "raise")
 
+    def test_folds_cinnabar_hand_after_opponent_reraises(self):
+        evidence = [
+            showdown_hand(1, 5, 6, 12, winner=12),
+            showdown_hand(2, 5, 1, 11, winner=11),
+            showdown_hand(3, 2, 5, 8, winner=8),
+            showdown_hand(4, 1, 7, 12, winner=12),
+        ]
+        game.update_rule_knowledge("cinnabar", evidence)
+
+        response = self.client.post(
+            "/move",
+            json=payload(
+                table_rule="cinnabar",
+                round="pre_reveal",
+                your_number=10,
+                community_number=None,
+                pot=27,
+                to_call=11,
+                min_raise_to=31,
+                current_hand_actions=[
+                    {"round": "pre_reveal", "seat": 0, "action": "raise", "amount": 7},
+                    {"round": "pre_reveal", "seat": 1, "action": "raise", "amount": 18},
+                ],
+            ),
+        )
+
+        self.assertEqual(response.get_json(), {"action": "fold"})
+
+    def test_folds_amaranth_hand_after_opponent_reraises(self):
+        evidence = [
+            showdown_hand(1, 13, 6, 10, winner=10),
+            showdown_hand(2, 10, 3, 12, winner=12),
+            showdown_hand(3, 12, 4, 6, winner=6),
+            showdown_hand(4, 11, 4, 8, winner=8),
+        ]
+        game.update_rule_knowledge("amaranth", evidence)
+
+        response = self.client.post(
+            "/move",
+            json=payload(
+                table_rule="amaranth",
+                round="post_reveal",
+                your_number=10,
+                community_number=13,
+                pot=81,
+                to_call=38,
+                min_raise_to=97,
+                current_hand_actions=[
+                    {"round": "post_reveal", "seat": 1, "action": "bet", "amount": 7},
+                    {"round": "post_reveal", "seat": 0, "action": "raise", "amount": 19},
+                    {"round": "post_reveal", "seat": 1, "action": "raise", "amount": 57},
+                ],
+            ),
+        )
+
+        self.assertEqual(response.get_json(), {"action": "fold"})
+
+    def test_calls_instead_of_reraising_with_near_nut_equity(self):
+        evidence = [
+            showdown_hand(1, 13, 1, 5, winner=1),
+            showdown_hand(2, 3, 4, 12, winner=4),
+            showdown_hand(3, 12, 2, 8, winner=2),
+            showdown_hand(4, 1, 4, 8, winner=4),
+            showdown_hand(5, 5, 2, 5, winner=2),
+            showdown_hand(6, 5, 5, 8, winner=5),
+        ]
+        game.update_rule_knowledge("obsidian", evidence)
+
+        response = self.client.post(
+            "/move",
+            json=payload(
+                table_rule="obsidian",
+                round="pre_reveal",
+                your_number=1,
+                community_number=None,
+                pot=60,
+                to_call=20,
+                min_raise_to=90,
+                current_hand_actions=[
+                    {"round": "pre_reveal", "seat": 0, "action": "raise", "amount": 30},
+                    {"round": "pre_reveal", "seat": 1, "action": "raise", "amount": 50},
+                ],
+            ),
+        )
+
+        self.assertEqual(response.get_json(), {"action": "call"})
+
 
 if __name__ == "__main__":
     unittest.main()
