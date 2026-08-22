@@ -109,6 +109,15 @@ class ShowdownTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn(response.get_json()["action"], payload()["legal_actions"])
 
+    def test_health_reports_showdown_strategy_version(self):
+        response = self.client.get("/health")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.get_json(),
+            {"status": "ok", "showdown_strategy": "phase1-2-v3"},
+        )
+
     def test_corrupt_rule_memory_is_recovered(self):
         game.RULE_KNOWLEDGE_BASE["onyx"] = {
             "observations": [["bad", "low", "high", "result"]]

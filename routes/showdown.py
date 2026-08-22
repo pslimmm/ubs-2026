@@ -15,6 +15,7 @@ VALUE_EQUITY = 0.70
 BET_EQUITY = 0.60
 NUT_EQUITY = 12.5 / 13
 MAX_CALL_BLINDS = 5
+STRATEGY_VERSION = "phase1-2-v3"
 
 
 def load_memory() -> dict:
@@ -277,6 +278,11 @@ def _move(data: dict) -> dict:
             if action in legal:
                 return {"action": action, "amount": bounds[0]}
     return {"action": "check"}
+
+
+@app.route("/health", methods=["GET"])
+def showdown_health():
+    return jsonify(status="ok", showdown_strategy=STRATEGY_VERSION)
 
 
 @app.route("/move", methods=["POST"])
