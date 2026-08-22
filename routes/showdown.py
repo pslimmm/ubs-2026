@@ -1,67 +1,41 @@
 import json
 import logging
 import os
-import sys
-import traceback
-from flask import Flask, jsonify, request
 
-# Configure clear stdout logging for Cloud logs / ngrok terminals
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
+from flask import jsonify, request
+from routes import app
+
 logger = logging.getLogger(__name__)
+MEMORY_FILE = "table_rules_memory.json"
 
-app = Flask(__name__)
-MEMORY_FILE = "rule_hypotheses.json"
 
-# Rule evaluator functions
-def score_standard(c1, c2, comm):
-    p1, p2 = (c1 == comm), (c2 == comm)
-    return 1 if (p1, c1) > (p2, c2) else (-1 if (p1, c1) < (p2, c2) else 0)
-
-def score_lowball(c1, c2, comm):
-    p1, p2 = (c1 == comm), (c2 == comm)
-    return 1 if (p1, -c1) > (p2, -c2) else (-1 if (p1, -c1) < (p2, -c2) else 0)
-
-def score_closest(c1, c2, comm):
-    d1, d2 = abs(c1 - comm), abs(c2 - comm)
-    return 1 if d1 < d2 else (-1 if d1 > d2 else 0)
-
-def score_furthest(c1, c2, comm):
-    d1, d2 = abs(c1 - comm), abs(c2 - comm)
-    return 1 if d1 > d2 else (-1 if d1 > d2 else 0)
-
-def score_odd_even(c1, c2, comm):
-    k1 = (c1 % 2 != 0, c1 == comm, c1)
-    k2 = (c2 % 2 != 0, c2 == comm, c2)
-    return 1 if k1 > k2 else (-1 if k1 < k2 else 0)
-
-RULE_CANDIDATES = {
-    "standard": score_standard,
-    "lowball": score_lowball,
-    "closest": score_closest,
-    "furthest": score_furthest,
-    "odd_even": score_odd_even
-}
-
-def get_rule_scores(table_rule: str) -> dict:
+def load_memory() -> dict:
     if os.path.exists(MEMORY_FILE):
         try:
             with open(MEMORY_FILE, "r") as f:
-                data = json.load(f)
-                if table_rule in data:
-                    return data[table_rule]
+                return json.load(f)
         except Exception as e:
-            logger.error(f"Failed to read memory file: {e}")
-    return {name: 1.0 for name in RULE_CANDIDATES}
+            logger.error("Error loading rule memory: %s", e)
+    return {}
 
-def update_hypotheses(table_rule: str, recent_hands: list):
-    if not recent_hands:
+
+def save_memory(data: dict):
+    try:
+        with open(MEMORY_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        logger.error("Error saving rule memory: %s", e)
+
+
+RULE_KNOWLEDGE_BASE = load_memory()
+
+
+def update_rule_knowledge(table_rule: str, recent_hands: list):
+    """Parses recent showdowns to memoize pairwise comparison facts."""
+    if not table_rule or not recent_hands:
         return
 
-    scores = get_rule_scores(table_rule)
+    rule_data = RULE_KNOWLEDGE_BASE.setdefault(table_rule, {})
     updated = False
 
     for hand in recent_hands:
@@ -74,123 +48,115 @@ def update_hypotheses(table_rule: str, recent_hands: list):
             if c0 is None or c1 is None or c0 == c1:
                 continue
 
-            actual_res = 0 if len(winners) > 1 else (1 if winners[0] == 0 else -1)
+            comm_key = str(comm)
+            comm_data = rule_data.setdefault(comm_key, {})
+            pair_key = f"{min(c0, c1)}_{max(c0, c1)}"
 
-            for name, fn in RULE_CANDIDATES.items():
-                if scores[name] > 0:
-                    pred = fn(c0, c1, comm)
-                    if pred != actual_res:
-                        logger.info(f"Rule rule '{table_rule}': Eliminating hypothesis '{name}' based on hand outcome.")
-                        scores[name] = 0.0
-                        updated = True
+            if len(winners) > 1:
+                winner_card = "tie"
+            else:
+                winner_seat = str(winners[0])
+                winner_card = shown.get(winner_seat)
+
+            if pair_key not in comm_data:
+                comm_data[pair_key] = winner_card
+                updated = True
 
     if updated:
-        try:
-            all_data = {}
-            if os.path.exists(MEMORY_FILE):
-                with open(MEMORY_FILE, "r") as f:
-                    all_data = json.load(f)
-            all_data[table_rule] = scores
-            with open(MEMORY_FILE, "w") as f:
-                json.dump(all_data, f, indent=2)
-            logger.info(f"Updated rule memory saved for rule: {table_rule}")
-        except Exception as e:
-            logger.error(f"Failed to write memory file: {e}")
+        save_memory(RULE_KNOWLEDGE_BASE)
 
-def evaluate_strength(your_card: int, comm: int | None, table_rule: str) -> tuple[float, bool]:
-    scores = get_rule_scores(table_rule)
-    active_rules = [name for name, score in scores.items() if score > 0]
-    is_confident = len(active_rules) == 1
-
-    if comm is None:
-        return (your_card - 1 + 0.5) / 13.0, is_confident
-
-    total_wins = 0
-    total_evals = 0
-
-    for rule_name in active_rules:
-        fn = RULE_CANDIDATES[rule_name]
-        for opp_card in range(1, 14):
-            res = fn(your_card, opp_card, comm)
-            total_wins += 1.0 if res > 0 else (0.5 if res == 0 else 0.0)
-            total_evals += 1
-
-    win_prob = (total_wins / total_evals) if total_evals > 0 else 0.5
-    return win_prob, is_confident
-
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok"}), 200
 
 @app.route("/move", methods=["POST"])
 def showdown():
     data = request.get_json(silent=True) or {}
-    legal_actions = data.get("legal_actions", ["check", "fold"])
+    table_rule = data.get("table_rule", "standard")
 
-    try:
-        # Extract variables with logging
-        hand_num = data.get("hand_number")
-        leg_num = data.get("leg_number", 1)
-        round_phase = data.get("round")
-        table_rule = data.get("table_rule", "standard")
-        your_card = data.get("your_number")
-        comm_card = data.get("community_number")
-        to_call = data.get("to_call", 0)
-        pot = data.get("pot", 0)
-        min_raise = data.get("min_raise_to")
-        max_raise = data.get("max_raise_to")
+    # [MODIFICATION 1] Wire the learning loop into the request cycle
+    recent_hands = data.get("recent_hands", [])
+    update_rule_knowledge(table_rule, recent_hands)
 
-        logger.info(f"--- Leg {leg_num} | Hand #{hand_num} ({round_phase}) | Rule: '{table_rule}' ---")
-        logger.info(f"Your Card: {your_card} | Comm Card: {comm_card} | Pot: {pot} | To Call: {to_call}")
+    your_card = data.get("your_number")
+    community_card = data.get("community_number")
+    to_call = data.get("to_call", 0)
+    pot = data.get("pot", 0)
+    legal_actions = data.get("legal_actions", [])
+    min_raise = data.get("min_raise_to")
+    max_raise = data.get("max_raise_to")
 
-        # Update knowledge base
-        update_hypotheses(table_rule, data.get("recent_hands", []))
+    win_prob = evaluate_hand_strength(your_card, community_card, table_rule)
 
-        # Evaluate hand equity
-        win_prob, is_confident = evaluate_strength(your_card, comm_card, table_rule)
-        logger.info(f"Win Prob: {win_prob:.2f} | Confident in Rule: {is_confident}")
+    # [MODIFICATION 2] Value Betting Logic added for high-equity free actions
+    if win_prob > 0.70 and "raise" in legal_actions and min_raise is not None:
+        raise_size = int(min_raise + (max_raise - min_raise) * (win_prob - 0.70))
+        raise_size = min(max(raise_size, min_raise), max_raise)
+        return jsonify({"action": "raise", "amount": raise_size})
 
-        # Risk Management: Reduce aggressiveness pre-reveal if rule unknown
-        if not is_confident and comm_card is None:
-            win_prob = min(win_prob, 0.5)
+    elif win_prob > 0.55 and "bet" in legal_actions and to_call == 0 and min_raise is not None:
+        return jsonify({"action": "bet", "amount": min_raise})
 
-        can_raise = "raise" in legal_actions and min_raise is not None and max_raise is not None
-        can_bet = "bet" in legal_actions and min_raise is not None and max_raise is not None
+    pot_odds = to_call / (pot + to_call) if (pot + to_call) > 0 else 0
 
-        response = {}
+    if "call" in legal_actions and win_prob >= pot_odds:
+        return jsonify({"action": "call"})
 
-        # 1. High Equity: Value Raise / Bet
-        if win_prob > 0.70 and (can_raise or can_bet):
-            action = "raise" if can_raise else "bet"
-            fraction = (win_prob - 0.70) / 0.30
-            size = int(min_raise + (max_raise - min_raise) * fraction)
-            size = min(max(size, min_raise), max_raise)
-            response = {"action": action, "amount": size}
+    if "check" in legal_actions:
+        return jsonify({"action": "check"})
 
-        # 2. Moderate Equity: Open bet
-        elif win_prob > 0.55 and can_bet:
-            response = {"action": "bet", "amount": min_raise}
+    return jsonify({"action": "fold"})
 
-        # 3. Pot-Odds Call
-        elif "call" in legal_actions:
-            pot_odds = to_call / (pot + to_call) if (pot + to_call) > 0 else 0
-            if win_prob >= pot_odds:
-                response = {"action": "call"}
 
-        # 4. Fallbacks
-        if not response:
-            if "check" in legal_actions:
-                response = {"action": "check"}
-            else:
-                response = {"action": "fold"}
+def evaluate_hand_strength(
+    your_card: int | None,
+    community_card: int | None,
+    table_rule: str,
+) -> float:
+    """Calculates equity using independent uniform distribution."""
+    if your_card is None:
+        return 0.5
 
-        logger.info(f"Chosen Action: {response}")
-        return jsonify(response)
+    # [MODIFICATION 3] Fixed stochastic model: Cards are drawn with replacement.
+    # We evaluate against all 13 possible opponent cards.
+    deck = range(1, 14)
 
-    except Exception as e:
-        # Crash prevention: Return a safe legal move to avoid timeouts or forfeits
-        logger.error(f"Unhandled exception in /move: {e}")
-        logger.error(traceback.format_exc())
-        fallback_action = "check" if "check" in legal_actions else "fold"
-        logger.warning(f"Returning safe fallback action: {fallback_action}")
-        return jsonify({"action": fallback_action})
+    if community_card is None:
+        wins = your_card - 1
+        ties = 1
+        return (wins + ties * 0.5) / 13.0
+
+    wins = 0
+    ties = 0
+
+    for opp_card in deck:
+        res = compare_hands(your_card, opp_card, community_card, table_rule)
+        if res > 0:
+            wins += 1
+        elif res == 0:
+            ties += 0.5
+
+    return (wins + ties) / 13.0
+
+
+def compare_hands(c1: int, c2: int, comm: int, table_rule: str) -> int:
+    if c1 == c2:
+        return 0
+
+    rule_data = RULE_KNOWLEDGE_BASE.get(table_rule, {})
+    comm_data = rule_data.get(str(comm), {})
+    pair_key = f"{min(c1, c2)}_{max(c1, c2)}"
+
+    if pair_key in comm_data:
+        winner = comm_data[pair_key]
+        if winner == c1:
+            return 1
+        elif winner == c2:
+            return -1
+        elif winner == "tie":
+            return 0
+
+    score1 = (c1 == comm, c1)
+    score2 = (c2 == comm, c2)
+    if score1 > score2:
+        return 1
+    elif score1 < score2:
+        return -1
+    return 0
