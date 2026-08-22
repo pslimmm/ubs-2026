@@ -97,20 +97,20 @@ def solve_case(case):
     for year in years:
         quotes = timeline.get(str(year), {})
 
-        # Sell lots at a local maximum before choosing the next investment.
+        # Rebalance at every year where the market quotes the held stock.
+        # Keeping a position merely because it may rise later can strand
+        # capital while a different stock has a better reachable return.
         for name in list(holdings):
             if name not in quotes:
                 continue
             current_price = int(quotes[name]["price"])
-            later = future.get((year, name), (current_price, year))
-            if year == FINAL_YEAR or current_price >= later[0]:
-                quantity = sum(qty for qty, _ in holdings.pop(name))
-                cash += quantity * current_price
-                actions_by_year[year].append(("s", name, quantity))
-                logger.info(
-                    "stonks sell year=%s stock=%s quantity=%s price=%s cash=%s",
-                    year, name, quantity, current_price, cash,
-                )
+            quantity = sum(qty for qty, _ in holdings.pop(name))
+            cash += quantity * current_price
+            actions_by_year[year].append(("s", name, quantity))
+            logger.info(
+                "stonks sell year=%s stock=%s quantity=%s price=%s cash=%s",
+                year, name, quantity, current_price, cash,
+            )
 
         candidates = []
         for name, quote in quotes.items():
