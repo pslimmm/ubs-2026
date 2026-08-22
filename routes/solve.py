@@ -47,7 +47,7 @@ def slo_output(heartbeats, query):
         return {"availability": 0, "p95LatencyMs": 0}
 
     latencies = sorted(heartbeat["latencyMs"] for heartbeat in matching)
-    p95_index = math.ceil(0.95 * (len(latencies) - 1))
+    p95_index = math.ceil(0.95 * len(latencies)) - 1
     return {
         "availability": sum(
             heartbeat["status"].upper() == "OK" for heartbeat in matching
