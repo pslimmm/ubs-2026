@@ -1,6 +1,6 @@
 import heapq
 import math
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional, Set, Tuple
@@ -13,6 +13,10 @@ from routes import app
 BASELINE_RISK = 0.05
 RETURN_PATH_WEIGHT = 2.0
 SATURATION_SCALE = 6.0
+IDENTITY_CONNECTED_WEIGHT = 0.16
+IDENTITY_DISCONNECTED_WEIGHT = 0.05
+IDENTITY_DIVERGENCE_WEIGHT = 0.10
+IDENTITY_MISSING_WEIGHT = 0.12
 
 
 @dataclass(frozen=True)
@@ -62,6 +66,16 @@ class GraphRiskEngine:
         self.nodes: Set[str] = set()
         self.latest_time: Optional[datetime] = None
         self.sequence = 0
+        # Identity indexes are maintained independently for IP and device so
+        # that either signal can contribute without masking the other.
+        self.identity_user_values = {
+            "ip": defaultdict(Counter),
+            "device": defaultdict(Counter),
+        }
+        self.identity_value_users = {
+            "ip": defaultdict(set),
+            "device": defaultdict(set),
+        }
 
     def reset(self):
         self.processed_txs.clear()
@@ -71,6 +85,10 @@ class GraphRiskEngine:
         self.nodes.clear()
         self.latest_time = None
         self.sequence = 0
+        for index in self.identity_user_values.values():
+            index.clear()
+        for index in self.identity_value_users.values():
+            index.clear()
 
     def _remove_edge(self, source: str, target: str):
         for graph, left, right in (
@@ -83,12 +101,36 @@ class GraphRiskEngine:
             if not graph[left]:
                 del graph[left]
 
+    def _identity_pairs(self, tx: Transaction):
+        return (
+            ("ip", tx.ip_address),
+            ("device", tx.device_id),
+        )
+
+    def _remove_identity(self, tx: Transaction):
+        for kind, value in self._identity_pairs(tx):
+            if value is None or value == "":
+                continue
+            user_counts = self.identity_user_values[kind][tx.from_user]
+            user_counts[value] -= 1
+            if user_counts[value] <= 0:
+                del user_counts[value]
+                self.identity_value_users[kind][value].discard(tx.from_user)
+                if not self.identity_value_users[kind][value]:
+                    del self.identity_value_users[kind][value]
+            if not user_counts:
+                del self.identity_user_values[kind][tx.from_user]
+
+    def _remove_active(self, tx: Transaction):
+        self._remove_edge(tx.from_user, tx.to_user)
+        self._remove_identity(tx)
+
     def _advance_window(self, timestamp: datetime) -> datetime:
         self.latest_time = max(self.latest_time or timestamp, timestamp)
         cutoff = self.latest_time - self.lookback
         while self.history and self.history[0][0] <= cutoff:
             _, _, expired = heapq.heappop(self.history)
-            self._remove_edge(expired.from_user, expired.to_user)
+            self._remove_active(expired)
         self.nodes = set(self.adj) | {
             target for targets in self.adj.values() for target in targets
         }
@@ -176,14 +218,68 @@ class GraphRiskEngine:
         score = 1 - (1 - BASELINE_RISK) * math.exp(-impact / SATURATION_SCALE)
         return round(score, 4)
 
+    def _identity_score(self, tx: Transaction) -> float:
+        """Return bounded identity evidence from the active graph.
+
+        Connected reuse is the strongest signal. Reuse outside the current
+        structural neighborhood is weaker, while a changed or missing value
+        on a previously identified path is treated as an anomaly only when
+        there is surrounding identity evidence.
+        """
+        upstream = self._reachable(tx.from_user, self.rev)
+        downstream = self._reachable(tx.to_user, self.adj)
+        connected_users = upstream | downstream | {tx.from_user, tx.to_user}
+        identity_score = 0.0
+
+        for kind, value in self._identity_pairs(tx):
+            users_by_value = self.identity_value_users[kind]
+            user_values = self.identity_user_values[kind]
+            connected_values = {
+                observed
+                for user in connected_users
+                for observed in user_values.get(user, {})
+            }
+
+            if value is None or value == "":
+                # Missing identity is meaningful only if the connected
+                # neighborhood has already carried this identity dimension.
+                if connected_values:
+                    identity_score += IDENTITY_MISSING_WEIGHT
+                continue
+
+            connected_matches = len(users_by_value.get(value, set()) & connected_users)
+            disconnected_matches = len(users_by_value.get(value, set()) - connected_users)
+
+            if connected_matches:
+                identity_score += IDENTITY_CONNECTED_WEIGHT
+            elif disconnected_matches:
+                identity_score += IDENTITY_DISCONNECTED_WEIGHT
+
+            # A value shift in a connected flow is stronger than a merely
+            # shared value in an unrelated component.
+            if connected_values and value not in connected_values:
+                identity_score += IDENTITY_DIVERGENCE_WEIGHT
+
+        return min(identity_score, 0.45)
+
     def _score(self, tx: Transaction) -> float:
-        """Extension point for later identity and value signal phases."""
-        return self._structural_score(tx.from_user, tx.to_user)
+        structural = self._structural_score(tx.from_user, tx.to_user)
+        identity = self._identity_score(tx)
+        # Treat identity as corroborating evidence rather than replacing the
+        # structural score. This keeps scores bounded and preserves ordering
+        # for Phase 1-only transactions.
+        combined = 1 - (1 - structural) * (1 - identity)
+        return round(min(max(combined, 0.0), 1.0), 4)
 
     def _add_active(self, tx: Transaction):
         self.adj[tx.from_user][tx.to_user] += 1
         self.rev[tx.to_user][tx.from_user] += 1
         self.nodes.update((tx.from_user, tx.to_user))
+        for kind, value in self._identity_pairs(tx):
+            if value is None or value == "":
+                continue
+            self.identity_user_values[kind][tx.from_user][value] += 1
+            self.identity_value_users[kind][value].add(tx.from_user)
         heapq.heappush(self.history, (tx.timestamp, self.sequence, tx))
         self.sequence += 1
 
