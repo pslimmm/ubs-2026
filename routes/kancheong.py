@@ -1,11 +1,13 @@
-import logging
 import heapq
+import logging
 from datetime import datetime, timezone
+
 from flask import jsonify, request
 
 from routes import app
 
 logger = logging.getLogger(__name__)
+
 
 @app.route('/kan-cheong-delivery-driver', methods=['POST'])
 def kan_cheong_delivery_driver():
@@ -98,6 +100,7 @@ def build_graph(nodes, edges):
 
     return graph
 
+
 def get_travel_time(edge_id, u, v, t_start, base_duration, obstructions):
     # Filter and pre-parse obstructions for this edge in this direction
     matching_obs = []
@@ -110,27 +113,28 @@ def get_travel_time(edge_id, u, v, t_start, base_duration, obstructions):
             t_start_parsed = parse_time(obs["start_time"])
             t_end_parsed = parse_time(obs["end_time"])
             if t_start_parsed is not None and t_end_parsed is not None:
-                matching_obs.append({
-                    "start": t_start_parsed,
-                    "end": t_end_parsed,
-                    "speed_factor": obs["speed_factor"]
-                })
+                matching_obs.append(
+                    {
+                        "start": t_start_parsed,
+                        "end": t_end_parsed,
+                        "speed_factor": obs["speed_factor"],
+                    }
+                )
 
+    def speed_factor_at(time):
+        return min(
+            (
+                obs["speed_factor"]
+                for obs in matching_obs
+                if obs["start"] <= time < obs["end"]
+            ),
+            default=1.0,
+        )
+
+    if speed_factor_at(t_start) == 0.0:
+        return None
     if base_duration == 0:
-        # Check if it is blocked at t_start
-        active_sfs = [
-            obs["speed_factor"] for obs in matching_obs
-            if obs["start"] <= t_start <= obs["end"]
-        ]
-        return None if (active_sfs and min(active_sfs) == 0.0) else t_start
-
-    # Helper to determine active speed factor in the interval [t_curr, t_next)
-    def get_speed_factor(t_curr, t_next):
-        active_sfs = [
-            obs["speed_factor"] for obs in matching_obs
-            if obs["start"] <= t_curr and (obs["end"] >= t_next if t_next != float("inf") else obs["end"] > t_curr)
-        ]
-        return min(active_sfs) if active_sfs else 1.0
+        return t_start
 
     # Collect all transition times for this edge after t_start
     transitions = {t_start}
@@ -149,10 +153,11 @@ def get_travel_time(edge_id, u, v, t_start, base_duration, obstructions):
 
     for i in range(len(T) - 1):
         t_curr, t_next = T[i], T[i + 1]
-        sf = get_speed_factor(t_curr, t_next)
+        sf = speed_factor_at(t_curr)
 
         if sf == 0.0:
-            return None  # Traversal is blocked
+            curr_time = t_next
+            continue
 
         if t_next == float("inf"):
             # We must finish in this final, obstruction-free interval
