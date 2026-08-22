@@ -1,162 +1,165 @@
-import json
 import logging
-import os
+import sys
 
-from flask import jsonify, request
+from flask import Flask, jsonify, request
+
 from routes import app
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
 logger = logging.getLogger(__name__)
-MEMORY_FILE = "table_rules_memory.json"
 
 
-def load_memory() -> dict:
-    if os.path.exists(MEMORY_FILE):
-        try:
-            with open(MEMORY_FILE, "r") as f:
-                return json.load(f)
-        except Exception as e:
-            logger.error("Error loading rule memory: %s", e)
-    return {}
+def compute_multiway_equity(
+    your_card: int | None, comm_card: int | None, recent_hands: list, num_opponents: int
+) -> float:
+    """Calculates win probability against N active opponents dynamically from recent_hands."""
+    if your_card is None or num_opponents <= 0:
+        return 0.5
 
+    # Pre-reveal: calculate probability of beating one random card raised to N opponents
+    if comm_card is None:
+        p_single = (your_card - 1 + 0.5) / 13.0
+        return p_single**num_opponents
 
-def save_memory(data: dict):
-    try:
-        with open(MEMORY_FILE, "w") as f:
-            json.dump(data, f, indent=2)
-    except Exception as e:
-        logger.error("Error saving rule memory: %s", e)
-
-
-RULE_KNOWLEDGE_BASE = load_memory()
-
-
-def update_rule_knowledge(table_rule: str, recent_hands: list):
-    """Parses recent showdowns to memoize pairwise comparison facts."""
-    if not table_rule or not recent_hands:
-        return
-
-    rule_data = RULE_KNOWLEDGE_BASE.setdefault(table_rule, {})
-    updated = False
+    # 1. Build transitive card dominance matrix (13x13)
+    matrix = [[False] * 14 for _ in range(14)]
 
     for hand in recent_hands:
+        hand_comm = hand.get("community_number")
         shown = hand.get("shown_numbers", {})
-        winners = hand.get("winners", [])
-        comm = hand.get("community_number")
+        winners = [str(w) for w in hand.get("winners", [])]
 
-        if len(shown) == 2 and comm is not None:
-            c0, c1 = shown.get("0"), shown.get("1")
-            if c0 is None or c1 is None or c0 == c1:
-                continue
+        # Multiway showdown processing
+        if hand_comm == comm_card and len(shown) >= 2 and winners:
+            winning_cards = {
+                shown[s] for s in winners if s in shown and shown[s] is not None
+            }
+            losing_cards = {
+                shown[s] for s in shown if s not in winners and shown[s] is not None
+            }
 
-            comm_key = str(comm)
-            comm_data = rule_data.setdefault(comm_key, {})
-            pair_key = f"{min(c0, c1)}_{max(c0, c1)}"
+            for w_card in winning_cards:
+                for l_card in losing_cards:
+                    if w_card != l_card:
+                        matrix[w_card][l_card] = True
 
-            if len(winners) > 1:
-                winner_card = "tie"
-            else:
-                winner_seat = str(winners[0])
-                winner_card = shown.get(winner_seat)
+    # 2. Transitive Closure (Floyd-Warshall over cards 1 to 13)
+    for k in range(1, 14):
+        for i in range(1, 14):
+            for j in range(1, 14):
+                if matrix[i][k] and matrix[k][j]:
+                    matrix[i][j] = True
 
-            if pair_key not in comm_data:
-                comm_data[pair_key] = winner_card
-                updated = True
+    # 3. Compute probability against 1 opponent, then scale exponentially for N opponents
+    must_wins = sum(
+        1 for opp in range(1, 14) if opp != your_card and matrix[your_card][opp]
+    )
+    p_single = (must_wins + 0.5) / 13.0
 
-    if updated:
-        save_memory(RULE_KNOWLEDGE_BASE)
+    return p_single**num_opponents
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok"}), 200
 
 
 @app.route("/move", methods=["POST"])
 def showdown():
     data = request.get_json(silent=True) or {}
-    table_rule = data.get("table_rule", "standard")
+    legal_actions = data.get("legal_actions", ["check", "fold"])
 
-    # [MODIFICATION 1] Wire the learning loop into the request cycle
-    recent_hands = data.get("recent_hands", [])
-    update_rule_knowledge(table_rule, recent_hands)
+    try:
+        your_card = data.get("your_number")
+        comm_card = data.get("community_number")
+        to_call = data.get("to_call", 0)
+        pot = data.get("pot", 0)
+        min_raise = data.get("min_raise_to")
+        max_raise = data.get("max_raise_to")
+        recent_hands = data.get("recent_hands", [])
+        players = data.get("players", [])
 
-    your_card = data.get("your_number")
-    community_card = data.get("community_number")
-    to_call = data.get("to_call", 0)
-    pot = data.get("pot", 0)
-    legal_actions = data.get("legal_actions", [])
-    min_raise = data.get("min_raise_to")
-    max_raise = data.get("max_raise_to")
+        # 1. Filter active live opponents (not folded, not busted, not self)
+        active_opponents = [
+            p
+            for p in players
+            if p.get("name") != "you"
+            and not p.get("folded", False)
+            and not p.get("busted", False)
+        ]
+        num_opps = max(len(active_opponents), 1)
 
-    win_prob = evaluate_hand_strength(your_card, community_card, table_rule)
+        # 2. Score & Standings Evaluation
+        me = next((p for p in players if p.get("name") == "you"), {})
+        my_delta = me.get("chip_delta", 0)
+        opp_deltas = [p.get("chip_delta", 0) for p in players if p.get("name") != "you"]
+        max_opp_delta = max(opp_deltas) if opp_deltas else -200
 
-    # [MODIFICATION 2] Value Betting Logic added for high-equity free actions
-    if win_prob > 0.70 and "raise" in legal_actions and min_raise is not None:
-        raise_size = int(min_raise + (max_raise - min_raise) * (win_prob - 0.70))
-        raise_size = min(max(raise_size, min_raise), max_raise)
-        return jsonify({"action": "raise", "amount": raise_size})
+        # Victory condition check: strictly top the table and chip_delta >= +10
+        is_topping_table = (my_delta >= 10) and (my_delta > max_opp_delta)
 
-    elif win_prob > 0.55 and "bet" in legal_actions and to_call == 0 and min_raise is not None:
-        return jsonify({"action": "bet", "amount": min_raise})
+        # 3. Compute Equity scaled for N opponents
+        equity = compute_multiway_equity(your_card, comm_card, recent_hands, num_opps)
 
-    pot_odds = to_call / (pot + to_call) if (pot + to_call) > 0 else 0
+        # Relative Equity Multiplier vs Fair Share (Fair Share = 1 / (N + 1))
+        fair_share = 1.0 / (num_opps + 1)
+        equity_ratio = equity / fair_share if fair_share > 0 else 1.0
 
-    if "call" in legal_actions and win_prob >= pot_odds:
-        return jsonify({"action": "call"})
+        can_raise = (
+            "raise" in legal_actions and min_raise is not None and max_raise is not None
+        )
+        can_bet = (
+            "bet" in legal_actions and min_raise is not None and max_raise is not None
+        )
 
-    if "check" in legal_actions:
-        return jsonify({"action": "check"})
+        # --- DECISION TREE ---
 
-    return jsonify({"action": "fold"})
+        # RULE A: TOP-THE-TABLE LOCKDOWN
+        # If currently meeting the win condition, minimize risk and protect chips
+        if is_topping_table:
+            if "check" in legal_actions:
+                return jsonify({"action": "check"})
+            if "call" in legal_actions and to_call <= 2:
+                return jsonify({"action": "call"})
+            return jsonify({"action": "fold"})
 
+        # RULE B: PRE-REVEAL MULTIWAY TIGHTENING
+        # In multiway pots (3+ active opponents), fold low cards facing pre-reveal raises
+        if comm_card is None and num_opps >= 2 and to_call > 2 and your_card < 9:
+            return jsonify({"action": "fold"})
 
-def evaluate_hand_strength(
-    your_card: int | None,
-    community_card: int | None,
-    table_rule: str,
-) -> float:
-    """Calculates equity using independent uniform distribution."""
-    if your_card is None:
-        return 0.5
+        # RULE C: VALUE BETTING & RAISING
+        # Require holding at least 1.4x fair-share equity to open/raise multiway
+        if equity_ratio >= 1.4 and (can_raise or can_bet):
+            action = "raise" if can_raise else "bet"
+            fraction = min((equity_ratio - 1.4) / 1.0, 1.0)
+            size = int(min_raise + (max_raise - min_raise) * fraction)
+            return jsonify(
+                {"action": action, "amount": min(max(size, min_raise), max_raise)}
+            )
 
-    # [MODIFICATION 3] Fixed stochastic model: Cards are drawn with replacement.
-    # We evaluate against all 13 possible opponent cards.
-    deck = range(1, 14)
+        # RULE D: POT-ODDS & MULTIWAY CALLING DEFENSE
+        if "call" in legal_actions:
+            pot_odds = to_call / (pot + to_call) if (pot + to_call) > 0 else 0
 
-    if community_card is None:
-        wins = your_card - 1
-        ties = 1
-        return (wins + ties * 0.5) / 13.0
+            # Require equity advantage when facing bets larger than small blind (2 chips)
+            if to_call > 2:
+                if equity >= pot_odds and equity_ratio >= 1.1:
+                    return jsonify({"action": "call"})
+            else:
+                if equity >= pot_odds:
+                    return jsonify({"action": "call"})
 
-    wins = 0
-    ties = 0
+        # RULE E: DEFAULT SAFE FALLBACK
+        if "check" in legal_actions:
+            return jsonify({"action": "check"})
 
-    for opp_card in deck:
-        res = compare_hands(your_card, opp_card, community_card, table_rule)
-        if res > 0:
-            wins += 1
-        elif res == 0:
-            ties += 0.5
+        return jsonify({"action": "fold"})
 
-    return (wins + ties) / 13.0
-
-
-def compare_hands(c1: int, c2: int, comm: int, table_rule: str) -> int:
-    if c1 == c2:
-        return 0
-
-    rule_data = RULE_KNOWLEDGE_BASE.get(table_rule, {})
-    comm_data = rule_data.get(str(comm), {})
-    pair_key = f"{min(c1, c2)}_{max(c1, c2)}"
-
-    if pair_key in comm_data:
-        winner = comm_data[pair_key]
-        if winner == c1:
-            return 1
-        elif winner == c2:
-            return -1
-        elif winner == "tie":
-            return 0
-
-    score1 = (c1 == comm, c1)
-    score2 = (c2 == comm, c2)
-    if score1 > score2:
-        return 1
-    elif score1 < score2:
-        return -1
-    return 0
+    except Exception as e:
+        logger.error(f"Fallback triggered by error: {e}")
+        return jsonify({"action": "check" if "check" in legal_actions else "fold"})
