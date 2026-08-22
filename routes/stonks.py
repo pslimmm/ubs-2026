@@ -1,6 +1,7 @@
 """Solver for the time-travelling stock challenge."""
 
 from collections import defaultdict
+import logging
 
 from flask import jsonify, request
 
@@ -8,6 +9,7 @@ from routes import app
 
 
 FINAL_YEAR = 2037
+logger = logging.getLogger(__name__)
 
 
 def _future_maxima(timeline, years):
@@ -40,6 +42,13 @@ def solve_case(case):
         years.append(FINAL_YEAR)
         years.sort()
 
+    logger.info(
+        "stonks case energy=%s starting_capital=%s reachable_years=%s",
+        energy,
+        cash,
+        years,
+    )
+
     future = _future_maxima(timeline, years)
     holdings = defaultdict(list)  # name -> [(quantity, purchase price)]
     actions_by_year = defaultdict(list)
@@ -57,6 +66,10 @@ def solve_case(case):
                 quantity = sum(qty for qty, _ in holdings.pop(name))
                 cash += quantity * current_price
                 actions_by_year[year].append(("s", name, quantity))
+                logger.info(
+                    "stonks sell year=%s stock=%s quantity=%s price=%s cash=%s",
+                    year, name, quantity, current_price, cash,
+                )
 
         candidates = []
         for name, quote in quotes.items():
@@ -75,6 +88,10 @@ def solve_case(case):
             cash -= quantity * price
             holdings[name].append((quantity, price))
             actions_by_year[year].append(("b", name, quantity))
+            logger.info(
+                "stonks buy year=%s stock=%s quantity=%s price=%s cash=%s expected_sale=%s",
+                year, name, quantity, price, cash, later_price,
+            )
 
     action_years = sorted(actions_by_year)
     actions = []
@@ -87,15 +104,29 @@ def solve_case(case):
             actions.append(f"{action}-{name}-{quantity}")
     if current_year != FINAL_YEAR:
         actions.append(f"j-{current_year}-{FINAL_YEAR}")
+    logger.info(
+        "stonks case complete actions=%s ending_cash=%s response=%s",
+        len(actions), cash, actions,
+    )
     return actions
 
 
 @app.route("/stonks", methods=["POST"])
 def stonks():
     data = request.get_json(silent=True)
+    logger.info(
+        "stonks request remote=%s content_length=%s cases=%s",
+        request.remote_addr,
+        request.content_length,
+        len(data) if isinstance(data, list) else None,
+    )
     if not isinstance(data, list):
+        logger.warning("stonks invalid request: body must be an array")
         return jsonify({"error": "request body must be an array"}), 400
     try:
-        return jsonify([solve_case(case) for case in data])
+        result = [solve_case(case) for case in data]
+        logger.info("stonks response cases=%s", len(result))
+        return jsonify(result)
     except (KeyError, TypeError, ValueError, AttributeError):
+        logger.exception("stonks invalid request payload")
         return jsonify({"error": "invalid stonks request"}), 400
