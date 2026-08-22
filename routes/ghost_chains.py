@@ -16,7 +16,10 @@ logger = logging.getLogger(__name__)
 
 BASELINE_RISK = 0.05
 RETURN_PATH_WEIGHT = 2.0
-SATURATION_SCALE = 6.0
+# Keep structural growth distinguishable across a busy graph. A smaller value
+# makes broad reachability saturate too quickly and turns ordinary later
+# transactions into near-certain risk scores.
+SATURATION_SCALE = 12.0
 IDENTITY_CONNECTED_WEIGHT = 0.16
 IDENTITY_DISCONNECTED_WEIGHT = 0.05
 IDENTITY_DIVERGENCE_WEIGHT = 0.10
