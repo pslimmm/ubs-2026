@@ -16,7 +16,14 @@ CALL_EQUITY = 0.80
 STEAL_EQUITY = 0.35
 NUT_EQUITY = 12.5 / 13
 MAX_CALL_BLINDS = 10
-STRATEGY_VERSION = "phase1-2-v4"
+PHASE_TWO_TARGET = 25
+PHASE_TWO_BUFFER = 5
+MITIGATION_MAX_BLINDS = 4
+OPPONENT_RAISE_EQUITY = 0.70
+OPPONENT_BET_EQUITY = 0.60
+RANGE_CALL_FLOOR = 0.50
+RANGE_SAFETY_MARGIN = 0.10
+STRATEGY_VERSION = "phase1-2-v5"
 
 
 def load_memory() -> dict:
@@ -112,6 +119,7 @@ def _metric(name: str, card: int, community: int) -> int:
     return {
         "card": card,
         "pair": int(card == community),
+        "pair_seven": 2 if card == community else int(card == 7),
         "distance": abs(card - community),
         "parity": card % 2,
         "same_parity": int(card % 2 == community % 2),
@@ -124,7 +132,8 @@ def _metric(name: str, card: int, community: int) -> int:
 MODELS = tuple(
     (metric, direction, tiebreak)
     for metric in (
-        "card", "pair", "distance", "parity", "same_parity", "prime", "above", "edge"
+        "card", "pair", "pair_seven", "distance", "parity", "same_parity",
+        "prime", "above", "edge"
     ) + NUMBER_METRICS
     for direction in (-1, 1)
     for tiebreak in (-1, 0, 1)
@@ -133,7 +142,7 @@ STANDARD_MODEL = ("pair", 1, 1)
 KNOWN_MODELS = {
     "verdigris": STANDARD_MODEL,
     "cinnabar": STANDARD_MODEL,
-    "amaranth": ("number_7", 1, 1),
+    "amaranth": ("pair_seven", 1, 1),
     "obsidian": ("card", -1, 0),
 }
 
@@ -219,10 +228,7 @@ def _future_blind_cost(data: dict) -> float:
     )
 
 
-def _secured(data: dict) -> bool:
-    target = {1: 10, 2: 25}.get(data.get("phase"))
-    if target is None:
-        return False
+def _live_delta(data: dict) -> float:
     seat = data.get("your_seat")
     you = next((player for player in data.get("players", [])
                 if player.get("seat") == seat or player.get("name") == "you"), {})
@@ -230,8 +236,31 @@ def _secured(data: dict) -> bool:
     stack, starting = data.get("your_stack"), data.get("starting_stack")
     if isinstance(stack, (int, float)) and isinstance(starting, (int, float)):
         delta = stack - starting
-    return (isinstance(delta, (int, float))
-            and delta >= target + _future_blind_cost(data))
+    return delta if isinstance(delta, (int, float)) else 0
+
+
+def _secured(data: dict) -> bool:
+    delta = _live_delta(data)
+    if data.get("phase") == 2:
+        return delta >= PHASE_TWO_TARGET + PHASE_TWO_BUFFER
+    if data.get("phase") == 1:
+        return delta >= 10 + _future_blind_cost(data)
+    return False
+
+
+def _mitigation_limit(data: dict) -> float | None:
+    """Maximum optional chips exposed by one Phase 2 decision."""
+    if data.get("phase") != 2:
+        return None
+    blind = data.get("big_blind", 2)
+    blind = blind if isinstance(blind, (int, float)) and blind > 0 else 2
+    delta = _live_delta(data)
+    if delta >= PHASE_TWO_TARGET + PHASE_TWO_BUFFER:
+        return 0
+    if delta >= PHASE_TWO_TARGET:
+        return blind
+    shortfall = PHASE_TWO_TARGET - delta
+    return max(blind, min(MITIGATION_MAX_BLINDS * blind, shortfall))
 
 
 def _current_actions(data: dict) -> tuple[dict, ...]:
@@ -241,6 +270,91 @@ def _current_actions(data: dict) -> tuple[dict, ...]:
     return tuple(
         action for action in actions
         if isinstance(action, dict) and action.get("round") == data.get("round")
+    )
+
+
+def _all_actions(data: dict) -> tuple[dict, ...]:
+    actions = data.get("current_hand_actions", [])
+    if not isinstance(actions, list):
+        return ()
+    return tuple(action for action in actions if isinstance(action, dict))
+
+
+def _is_opponent_action(action: dict, data: dict) -> bool:
+    return str(action.get("seat")) != str(data.get("your_seat"))
+
+
+def _opponent_range(data: dict) -> tuple[int, ...]:
+    """Conservative card range implied by the opponent's visible actions."""
+    candidates = tuple(CARDS)
+    our_last_pre_action = None
+    table_rule = data.get("table_rule", "standard")
+    community = data.get("community_number")
+
+    for action in _all_actions(data):
+        action_round = action.get("round")
+        action_name = action.get("action")
+        if not _is_opponent_action(action, data):
+            if action_round == "pre_reveal":
+                our_last_pre_action = action_name
+            continue
+
+        threshold = None
+        upper = None
+        action_community = None
+        if action_round == "pre_reveal" and action_name == "raise":
+            threshold = (0.50 if our_last_pre_action == "call"
+                         else OPPONENT_RAISE_EQUITY)
+        elif action_round == "post_reveal" and action_name == "bet":
+            threshold = OPPONENT_BET_EQUITY
+            action_community = community
+        elif action_round == "post_reveal" and action_name == "raise":
+            threshold = OPPONENT_RAISE_EQUITY
+            action_community = community
+        elif action_round == "post_reveal" and action_name == "check":
+            upper = OPPONENT_BET_EQUITY
+            action_community = community
+        else:
+            continue
+
+        narrowed = tuple(
+            card for card in candidates
+            if ((threshold is None
+                 or evaluate_hand_strength(card, action_community, table_rule)
+                 >= threshold)
+                and (upper is None
+                     or evaluate_hand_strength(card, action_community, table_rule)
+                     < upper))
+        )
+        if narrowed:
+            candidates = narrowed
+    return candidates
+
+
+def _range_equity(data: dict) -> float:
+    your_card = data.get("your_number")
+    community = data.get("community_number")
+    if your_card not in CARDS:
+        return 0.5
+    communities = CARDS if community is None else (community,)
+    if any(card not in CARDS for card in communities):
+        return 0.5
+    opponent_range = _opponent_range(data)
+    equities = (
+        _matchup_equity(your_card, opponent, card,
+                        data.get("table_rule", "standard"))
+        for card in communities
+        for opponent in opponent_range
+    )
+    return sum(equities) / (len(communities) * len(opponent_range))
+
+
+def _opponent_raised_pre_reveal(data: dict) -> bool:
+    return any(
+        action.get("round") == "pre_reveal"
+        and _is_opponent_action(action, data)
+        and action.get("action") == "raise"
+        for action in _all_actions(data)
     )
 
 
@@ -261,25 +375,51 @@ def _opponent_checked(data: dict) -> bool:
     )
 
 
-def _opponent_reraised(data: dict) -> bool:
-    our_seat = str(data.get("your_seat"))
-    our_wager = False
-    for action in _current_actions(data):
-        if str(action.get("seat")) == our_seat:
-            our_wager |= action.get("action") in ("bet", "raise")
-        elif our_wager and action.get("action") == "raise":
-            return True
-    return False
+def _current_contribution(data: dict) -> float:
+    seat = data.get("your_seat")
+    players = data.get("players", [])
+    if isinstance(players, list):
+        you = next((player for player in players
+                    if isinstance(player, dict)
+                    and (player.get("seat") == seat or player.get("name") == "you")), {})
+        contribution = you.get("bet_this_round")
+        if isinstance(contribution, (int, float)) and contribution >= 0:
+            return contribution
+    amounts = [
+        action.get("amount") for action in _current_actions(data)
+        if not _is_opponent_action(action, data)
+        and isinstance(action.get("amount"), (int, float))
+    ]
+    return amounts[-1] if amounts else 0
 
 
-def _wager_amount(data: dict, bounds: tuple[int, int]) -> int:
+def _wager_amount(data: dict, bounds: tuple[int, int]) -> int | None:
     blind = data.get("big_blind", 2)
     blind = blind if isinstance(blind, (int, float)) and blind > 0 else 2
     pot = data.get("pot", 0)
     pot = pot if isinstance(pot, (int, float)) and pot >= 0 else 0
     target = (round(2.5 * blind) if data.get("round") == "pre_reveal"
               else round(2 * pot / 3))
+    limit = _mitigation_limit(data)
+    if limit is not None:
+        if limit <= 0:
+            return None
+        maximum = _current_contribution(data) + limit
+        if bounds[0] > maximum:
+            return None
+        if _live_delta(data) >= PHASE_TWO_TARGET:
+            target = bounds[0]
+        else:
+            target = min(target, maximum)
     return max(bounds[0], min(target, bounds[1]))
+
+
+def _minimum_wager(data: dict, bounds: tuple[int, int]) -> int | None:
+    limit = _mitigation_limit(data)
+    if (limit is not None
+            and bounds[0] > _current_contribution(data) + limit):
+        return None
+    return bounds[0]
 
 
 def _move(data: dict) -> dict:
@@ -300,32 +440,51 @@ def _move(data: dict) -> dict:
     blind = blind if isinstance(blind, (int, float)) and blind > 0 else 2
     opponent_aggressive = _opponent_aggressive(data)
     bounds = _amount_bounds(data)
-    if _opponent_reraised(data):
-        if equity >= NUT_EQUITY and "call" in legal:
-            return {"action": "call"}
-        if "fold" in legal:
-            return {"action": "fold"}
 
     if (equity >= OPEN_EQUITY and to_call <= blind and not opponent_aggressive
             and "raise" in legal and bounds):
-        return {"action": "raise", "amount": _wager_amount(data, bounds)}
+        amount = _wager_amount(data, bounds)
+        if amount is not None:
+            return {"action": "raise", "amount": amount}
 
     if to_call:
         pot_odds = to_call / (pot + to_call)
         facing_wager = opponent_aggressive or to_call > blind
-        required = max(pot_odds, CALL_EQUITY if facing_wager else 0)
-        if "call" in legal and (
-                equity >= NUT_EQUITY
-                or (to_call <= blind * MAX_CALL_BLINDS and equity >= required)):
+        limit = _mitigation_limit(data)
+        if limit is not None and to_call > limit:
+            if "fold" in legal:
+                return {"action": "fold"}
+        decision_equity = _range_equity(data) if facing_wager else equity
+        if limit is None:
+            required = max(pot_odds, CALL_EQUITY if facing_wager else 0)
+            affordable = (decision_equity >= NUT_EQUITY
+                          or to_call <= blind * MAX_CALL_BLINDS)
+        else:
+            required = (max(RANGE_CALL_FLOOR, pot_odds + RANGE_SAFETY_MARGIN)
+                        if facing_wager else pot_odds)
+            affordable = to_call <= limit
+        if ("call" in legal and affordable
+                and decision_equity >= required):
             return {"action": "call"}
         if "fold" in legal:
             return {"action": "fold"}
 
+    if (data.get("round") == "post_reveal"
+            and _opponent_raised_pre_reveal(data)
+            and not any(_is_opponent_action(action, data)
+                        for action in _current_actions(data))
+            and "check" in legal):
+        return {"action": "check"}
+
     if "bet" in legal and bounds:
-        if _opponent_checked(data) and equity >= STEAL_EQUITY:
-            return {"action": "bet", "amount": bounds[0]}
+        if _opponent_checked(data) and _range_equity(data) >= STEAL_EQUITY:
+            amount = _minimum_wager(data, bounds)
+            if amount is not None:
+                return {"action": "bet", "amount": amount}
         if equity >= OPEN_EQUITY:
-            return {"action": "bet", "amount": _wager_amount(data, bounds)}
+            amount = _wager_amount(data, bounds)
+            if amount is not None:
+                return {"action": "bet", "amount": amount}
     for action in ("check", "fold", "call"):
         if action in legal:
             return {"action": action}
