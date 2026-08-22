@@ -1,173 +1,363 @@
-"""Solver for the time-travelling stock challenge."""
-
-from collections import defaultdict
+import heapq
+import itertools
 import logging
+from dataclasses import dataclass
 
 from flask import jsonify, request
 
 from routes import app
 
-
-FINAL_YEAR = 2037
-logger = logging.getLogger(__name__)
-
-
-def _best_purchases(cash, candidates):
-    """Choose the bounded set of purchases with the highest eventual value."""
-    if cash <= 0 or not candidates:
-        return cash, []
-
-    dp = [-1] * (cash + 1)
-    dp[0] = 0
-    parents = []
-    for sale_price, buy_price, name, available in candidates:
-        next_dp = dp[:]
-        parent = {}
-        max_quantity = min(int(available), cash // buy_price)
-        for spent, proceeds in enumerate(dp):
-            if proceeds < 0:
-                continue
-            for quantity in range(1, max_quantity + 1):
-                new_spent = spent + quantity * buy_price
-                if new_spent > cash:
-                    break
-                new_proceeds = proceeds + quantity * sale_price
-                if new_proceeds > next_dp[new_spent]:
-                    next_dp[new_spent] = new_proceeds
-                    parent[new_spent] = (spent, quantity)
-        dp = next_dp
-        parents.append(parent)
-
-    best_spent = max(range(cash + 1), key=lambda spent: dp[spent] + cash - spent)
-    best_value = dp[best_spent] + cash - best_spent
-    purchases = []
-    spent = best_spent
-    for index in range(len(candidates) - 1, -1, -1):
-        previous = parents[index].get(spent)
-        if previous is None:
-            continue
-        old_spent, quantity = previous
-        sale_price, buy_price, name, _ = candidates[index]
-        purchases.append((name, buy_price, quantity, sale_price))
-        spent = old_spent
-    return best_value, list(reversed(purchases))
+HOME = 2037
+MAX_SEARCH_STATES = 100_000
+MAX_PROBE_STATES = 250
+MAX_TRADE_STATES = 1_000
+MAX_QUANTITY_CHOICES = 64
 
 
-def _future_maxima(timeline, years):
-    result = {}
-    best = {}
-    for year in reversed(years):
-        for name, quote in timeline.get(str(year), {}).items():
-            price = int(quote["price"])
-            later = best.get(name)
-            result[(year, name)] = later if later is not None and later[0] >= price else (price, year)
-        for name, quote in timeline.get(str(year), {}).items():
-            price = int(quote["price"])
-            if name not in best or price > best[name][0]:
-                best[name] = (price, year)
-    return result
+@dataclass(frozen=True)
+class Lot:
+    year: int
+    stock: int
+    price: int
+    qty: int
 
 
-def solve_case(case):
-    energy = int(case["energy"])
-    cash = int(case["capital"])
-    timeline = case["timeline"]
+@dataclass(frozen=True)
+class Market:
+    years: tuple
+    stocks: tuple
+    prices: dict
+    lots: tuple
+    lot_at: dict
+    max_prices: tuple
+    exact: bool
 
-    # A round trip to a year d years in the past costs 2d energy.
-    oldest = max(0, FINAL_YEAR - energy // 2)
-    years = sorted(
-        (int(year) for year in timeline if oldest <= int(year) <= FINAL_YEAR),
-        key=int,
-    )
-    if FINAL_YEAR not in years:
-        years.append(FINAL_YEAR)
-        years.sort()
 
-    logger.info(
-        "stonks case energy=%s starting_capital=%s reachable_years=%s",
-        energy,
-        cash,
-        years,
-    )
-
-    future = _future_maxima(timeline, years)
-    holdings = defaultdict(list)  # name -> [(quantity, purchase price)]
-    actions_by_year = defaultdict(list)
-
-    for year in years:
-        quotes = timeline.get(str(year), {})
-
-        # Rebalance at every year where the market quotes the held stock.
-        # Keeping a position merely because it may rise later can strand
-        # capital while a different stock has a better reachable return.
-        for name in list(holdings):
-            if name not in quotes:
-                continue
-            current_price = int(quotes[name]["price"])
-            quantity = sum(qty for qty, _ in holdings.pop(name))
-            cash += quantity * current_price
-            actions_by_year[year].append(("s", name, quantity))
-            logger.info(
-                "stonks sell year=%s stock=%s quantity=%s price=%s cash=%s",
-                year, name, quantity, current_price, cash,
-            )
-
-        candidates = []
-        for name, quote in quotes.items():
-            price = int(quote["price"])
-            quantity = int(quote["qty"])
-            later_price, later_year = future.get((year, name), (price, year))
-            if quantity > 0 and later_year > year and later_price > price:
-                candidates.append((later_price, price, name, quantity))
-        optimized_cash, purchases = _best_purchases(cash, candidates)
-        for name, price, quantity, sale_price in purchases:
-            cash -= quantity * price
-            holdings[name].append((quantity, price))
-            actions_by_year[year].append(("b", name, quantity))
-            logger.info(
-                "stonks buy year=%s stock=%s quantity=%s price=%s cash=%s expected_sale=%s",
-                year, name, quantity, price, cash, sale_price,
-            )
-        if purchases:
-            logger.info(
-                "stonks allocation year=%s after_purchase_cash=%s projected_value=%s",
-                year, cash, optimized_cash,
-            )
-
-    action_years = sorted(actions_by_year)
-    actions = []
-    current_year = FINAL_YEAR
-    for year in action_years:
-        if year != current_year:
-            actions.append(f"j-{current_year}-{year}")
-            current_year = year
-        for action, name, quantity in actions_by_year[year]:
-            actions.append(f"{action}-{name}-{quantity}")
-    if current_year != FINAL_YEAR:
-        actions.append(f"j-{current_year}-{FINAL_YEAR}")
-    logger.info(
-        "stonks case complete actions=%s ending_cash=%s response=%s",
-        len(actions), cash, actions,
-    )
-    return actions
+@dataclass(frozen=True)
+class Label:
+    year: int
+    energy: int
+    cash: int
+    used: int
+    holdings: tuple
+    actions: tuple
 
 
 @app.route("/stonks", methods=["POST"])
 def stonks():
-    data = request.get_json(silent=True)
-    logger.info(
-        "stonks request remote=%s content_length=%s cases=%s",
-        request.remote_addr,
-        request.content_length,
-        len(data) if isinstance(data, list) else None,
-    )
-    if not isinstance(data, list):
-        logger.warning("stonks invalid request: body must be an array")
-        return jsonify({"error": "request body must be an array"}), 400
+    batch = request.get_json(silent=True)
+    if not isinstance(batch, list):
+        return jsonify({"error": "Invalid request"}), 400
+
     try:
-        result = [solve_case(case) for case in data]
-        logger.info("stonks response cases=%s", len(result))
-        return jsonify(result)
-    except (KeyError, TypeError, ValueError, AttributeError):
-        logger.exception("stonks invalid request payload")
-        return jsonify({"error": "invalid stonks request"}), 400
+        return jsonify([solve_case(case) for case in batch])
+    except (KeyError, TypeError, ValueError):
+        return jsonify({"error": "Invalid request"}), 400
+
+
+def solve_case(case):
+    energy, capital, market = _parse(case)
+    holdings = (0,) * len(market.stocks)
+    start = Label(HOME, 0, capital, 0, holdings, ())
+    incumbent = start
+    frontier = {HOME: [start]}
+    best = {_key(start): (capital, ())}
+    queue = []
+    counter = itertools.count()
+    root_bound = _upper_bound(start, market)
+    state_limit = _state_limit(market)
+    heapq.heappush(queue, (-root_bound, next(counter), start))
+    exact = True
+    expanded = 0
+
+    while queue and (state_limit is None or expanded < state_limit):
+        neg_bound, _, label = heapq.heappop(queue)
+        if -neg_bound <= incumbent.cash or best.get(_key(label)) != (
+            label.cash,
+            label.actions,
+        ):
+            continue
+        expanded += 1
+
+        trades, complete = _trade_options(label, market)
+        exact &= complete
+        for traded in trades:
+            if traded.year == HOME and _better_terminal(traded, incumbent):
+                incumbent = traded
+
+            for year in market.years:
+                if year == traded.year:
+                    continue
+                cost = abs(year - traded.year)
+                used = traded.energy + cost
+                if used + abs(HOME - year) > energy:
+                    continue
+
+                candidate = Label(
+                    year,
+                    used,
+                    traded.cash,
+                    traded.used,
+                    traded.holdings,
+                    traded.actions + (f"j-{traded.year}-{year}",),
+                )
+                bound = _upper_bound(candidate, market)
+                year_frontier = frontier.setdefault(year, [])
+                if bound <= incumbent.cash or _dominated(candidate, year_frontier):
+                    continue
+
+                key = _key(candidate)
+                previous = best.get(key)
+                value = (candidate.cash, candidate.actions)
+                if previous and (
+                    previous[0] > candidate.cash
+                    or (previous[0] == candidate.cash and previous[1] <= candidate.actions)
+                ):
+                    continue
+
+                best[key] = value
+                year_frontier.append(candidate)
+                heapq.heappush(queue, (-bound, next(counter), candidate))
+
+    exact &= not queue
+    gap = max(0, root_bound - incumbent.cash)
+    logging.info(
+        "stonks capital=%d final=%d states=%d exact=%s upper_gap=%d",
+        capital,
+        incumbent.cash,
+        expanded,
+        exact,
+        0 if exact else gap,
+    )
+    return list(incumbent.actions)
+
+
+def _parse(case):
+    if not isinstance(case, dict):
+        raise ValueError
+    energy = _positive_int(case["energy"])
+    capital = _positive_int(case["capital"])
+    if energy <= 1 or not isinstance(case["timeline"], dict):
+        raise ValueError
+
+    timeline = {}
+    stock_names = set()
+    for raw_year, entries in case["timeline"].items():
+        year = int(raw_year)
+        if not 0 < year <= HOME or not isinstance(entries, dict):
+            raise ValueError
+        timeline[year] = {}
+        for name, quote in entries.items():
+            if (
+                not isinstance(name, str)
+                or not name
+                or "-" in name
+                or not isinstance(quote, dict)
+            ):
+                raise ValueError
+            price = _positive_int(quote["price"])
+            qty = quote["qty"]
+            if not isinstance(qty, int) or isinstance(qty, bool) or qty < 0:
+                raise ValueError
+            timeline[year][name] = (price, qty)
+            stock_names.add(name)
+
+    stocks = tuple(sorted(stock_names))
+    stock_ids = {name: index for index, name in enumerate(stocks)}
+    prices = {
+        year: {stock_ids[name]: quote[0] for name, quote in entries.items()}
+        for year, entries in timeline.items()
+    }
+    prices.setdefault(HOME, {})
+    years = tuple(
+        year
+        for year in sorted(prices)
+        if year == HOME
+        or prices[year] and 2 * abs(HOME - year) <= energy
+    )
+    lots = []
+    lot_at = {}
+    for year in years:
+        for name, (price, qty) in sorted(timeline.get(year, {}).items()):
+            if qty:
+                lot_at[(year, stock_ids[name])] = len(lots)
+                lots.append(Lot(year, stock_ids[name], price, qty))
+
+    max_prices = tuple(
+        max((prices[year].get(stock, 0) for year in years), default=0)
+        for stock in range(len(stocks))
+    )
+    exact = _exact_size(energy, years, lots, len(stocks)) <= MAX_SEARCH_STATES
+    return energy, capital, Market(
+        years, stocks, prices, tuple(lots), lot_at, max_prices, exact
+    )
+
+
+def _positive_int(value):
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ValueError
+    return value
+
+
+def _state_limit(market):
+    return None if market.exact else MAX_PROBE_STATES
+
+
+def _exact_size(energy, years, lots, stock_count):
+    totals = [0] * stock_count
+    for lot in lots:
+        totals[lot.stock] += lot.qty
+    size = (energy + 1) * len(years) * (1 << len(lots))
+    for qty in totals:
+        size *= qty + 1
+        if size > MAX_SEARCH_STATES:
+            break
+    return size
+
+
+def _trade_options(label, market):
+    prices = market.prices[label.year]
+    original = label.holdings
+    states = {(label.used, original): (label.cash, label.actions)}
+    exact = True
+
+    # Sell first: at one timestamp all sale proceeds are available for purchases.
+    for stock in sorted(prices):
+        held = original[stock]
+        if not held:
+            continue
+        choices, complete = _quantities(held, market.exact)
+        exact &= complete
+        updated = {}
+        for (used, holdings), (cash, actions) in states.items():
+            for qty in choices:
+                values = list(holdings)
+                values[stock] -= qty
+                next_actions = actions
+                if qty:
+                    next_actions += (f"s-{market.stocks[stock]}-{qty}",)
+                _keep(updated, used, tuple(values), cash + qty * prices[stock], next_actions)
+        states, complete = _trim(updated, market)
+        exact &= complete
+
+    # Buy after every possible sale portfolio has been generated.
+    for stock in sorted(prices):
+        lot_id = market.lot_at.get((label.year, stock))
+        if lot_id is None or label.used & (1 << lot_id):
+            continue
+        price = prices[stock]
+        if price >= market.max_prices[stock]:
+            continue
+        lot = market.lots[lot_id]
+        updated = {}
+        for (used, holdings), (cash, actions) in states.items():
+            # Selling and rebuying the same fungible stock at one price is dominated.
+            sold_here = holdings[stock] < original[stock]
+            maximum = 0 if sold_here else min(lot.qty, cash // price)
+            choices, complete = _quantities(maximum, market.exact)
+            exact &= complete
+            for qty in choices:
+                values = list(holdings)
+                values[stock] += qty
+                next_used = used | ((1 << lot_id) if qty else 0)
+                next_actions = actions
+                if qty:
+                    next_actions += (f"b-{market.stocks[stock]}-{qty}",)
+                _keep(
+                    updated,
+                    next_used,
+                    tuple(values),
+                    cash - qty * price,
+                    next_actions,
+                )
+        states, complete = _trim(updated, market)
+        exact &= complete
+
+    labels = [
+        Label(label.year, label.energy, cash, used, holdings, actions)
+        for (used, holdings), (cash, actions) in states.items()
+    ]
+    labels.sort(key=lambda item: (-item.cash, item.used, item.holdings, item.actions))
+    return labels, exact
+
+
+def _quantities(limit, exact):
+    if exact or limit <= MAX_QUANTITY_CHOICES:
+        return range(limit + 1), True
+    values = {
+        0,
+        1,
+        2,
+        4,
+        limit // 4,
+        limit // 2,
+        3 * limit // 4,
+        limit - 4,
+        limit - 2,
+        limit - 1,
+        limit,
+    }
+    return tuple(sorted(value for value in values if 0 <= value <= limit)), False
+
+
+def _keep(states, used, holdings, cash, actions):
+    key = (used, holdings)
+    current = states.get(key)
+    if current is None or cash > current[0] or (
+        cash == current[0] and actions < current[1]
+    ):
+        states[key] = (cash, actions)
+
+
+def _trim(states, market):
+    if market.exact or len(states) <= MAX_TRADE_STATES:
+        return states, True
+    ranked = sorted(
+        states.items(),
+        key=lambda item: (
+            item[1][0]
+            + sum(
+                qty * market.max_prices[stock]
+                for stock, qty in enumerate(item[0][1])
+            ),
+            item[1][0],
+        ),
+        reverse=True,
+    )[:MAX_TRADE_STATES]
+    return dict(ranked), False
+
+
+def _upper_bound(label, market):
+    value = label.cash + sum(
+        qty * market.max_prices[stock]
+        for stock, qty in enumerate(label.holdings)
+    )
+    for lot_id, lot in enumerate(market.lots):
+        if not label.used & (1 << lot_id):
+            value += lot.qty * max(0, market.max_prices[lot.stock] - lot.price)
+    return value
+
+
+def _key(label):
+    return label.energy, label.year, label.used, label.holdings
+
+
+def _dominated(candidate, labels):
+    for other in labels:
+        if (
+            other.energy <= candidate.energy
+            and other.cash >= candidate.cash
+            and other.used & ~candidate.used == 0
+            and all(a >= b for a, b in zip(other.holdings, candidate.holdings))
+        ):
+            return True
+    return False
+
+
+def _better_terminal(candidate, incumbent):
+    return (
+        candidate.cash > incumbent.cash
+        or candidate.cash == incumbent.cash
+        and (candidate.energy, candidate.actions)
+        < (incumbent.energy, incumbent.actions)
+    )
