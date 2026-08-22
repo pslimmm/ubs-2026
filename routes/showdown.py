@@ -13,47 +13,54 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def compute_pessimistic_equity(
-    your_card: int, comm_card: int | None, recent_hands: list
+def compute_multiway_equity(
+    your_card: int | None, comm_card: int | None, recent_hands: list, num_opponents: int
 ) -> float:
-    """Dynamically builds card dominance graph from recent_hands and calculates equity on-the-fly."""
-    # Pre-reveal fallback (standard card value baseline)
-    if comm_card is None or your_card is None:
-        return (your_card - 1 + 0.5) / 13.0 if your_card else 0.5
+    """Calculates win probability against N active opponents dynamically from recent_hands."""
+    if your_card is None or num_opponents <= 0:
+        return 0.5
 
-    # 1. Initialize 14x14 adjacency matrix (cards 1 to 13)
+    # Pre-reveal: calculate probability of beating one random card raised to N opponents
+    if comm_card is None:
+        p_single = (your_card - 1 + 0.5) / 13.0
+        return p_single**num_opponents
+
+    # 1. Build transitive card dominance matrix (13x13)
     matrix = [[False] * 14 for _ in range(14)]
 
-    # 2. Extract direct showdown outcomes for THIS community card
     for hand in recent_hands:
-        shown = hand.get("shown_numbers", {})
-        winners = hand.get("winners", [])
         hand_comm = hand.get("community_number")
+        shown = hand.get("shown_numbers", {})
+        winners = [str(w) for w in hand.get("winners", [])]
 
-        # Only process hands that reached showdown with the matching community card
-        if hand_comm == comm_card and len(shown) == 2 and len(winners) == 1:
-            c0, c1 = shown.get("0"), shown.get("1")
-            if c0 is not None and c1 is not None and c0 != c1:
-                winner_seat = str(winners[0])
-                winner_card = shown.get(winner_seat)
-                loser_card = c1 if winner_card == c0 else c0
-                if winner_card and loser_card:
-                    matrix[winner_card][loser_card] = True
+        # Multiway showdown processing
+        if hand_comm == comm_card and len(shown) >= 2 and winners:
+            winning_cards = {
+                shown[s] for s in winners if s in shown and shown[s] is not None
+            }
+            losing_cards = {
+                shown[s] for s in shown if s not in winners and shown[s] is not None
+            }
 
-    # 3. Transitive Closure (Floyd-Warshall over 13 cards)
+            for w_card in winning_cards:
+                for l_card in losing_cards:
+                    if w_card != l_card:
+                        matrix[w_card][l_card] = True
+
+    # 2. Transitive Closure (Floyd-Warshall over cards 1 to 13)
     for k in range(1, 14):
         for i in range(1, 14):
             for j in range(1, 14):
                 if matrix[i][k] and matrix[k][j]:
                     matrix[i][j] = True
 
-    # 4. Count proven wins for your card
+    # 3. Compute probability against 1 opponent, then scale exponentially for N opponents
     must_wins = sum(
         1 for opp in range(1, 14) if opp != your_card and matrix[your_card][opp]
     )
+    p_single = (must_wins + 0.5) / 13.0
 
-    # Lower-bound equity (treats unobserved comparisons as non-wins)
-    return (must_wins + 0.5) / 13.0
+    return p_single**num_opponents
 
 
 @app.route("/health", methods=["GET"])
@@ -74,15 +81,33 @@ def showdown():
         min_raise = data.get("min_raise_to")
         max_raise = data.get("max_raise_to")
         recent_hands = data.get("recent_hands", [])
+        players = data.get("players", [])
 
-        # Extract current score delta to protect leads
-        me = next((p for p in data.get("players", []) if p.get("name") == "you"), {})
-        chip_delta = me.get("chip_delta", 0)
+        # 1. Filter active live opponents (not folded, not busted, not self)
+        active_opponents = [
+            p
+            for p in players
+            if p.get("name") != "you"
+            and not p.get("folded", False)
+            and not p.get("busted", False)
+        ]
+        num_opps = max(len(active_opponents), 1)
 
-        # Calculate equity strictly using the current payload's recent_hands
-        pessimistic_equity = compute_pessimistic_equity(
-            your_card, comm_card, recent_hands
-        )
+        # 2. Score & Standings Evaluation
+        me = next((p for p in players if p.get("name") == "you"), {})
+        my_delta = me.get("chip_delta", 0)
+        opp_deltas = [p.get("chip_delta", 0) for p in players if p.get("name") != "you"]
+        max_opp_delta = max(opp_deltas) if opp_deltas else -200
+
+        # Victory condition check: strictly top the table and chip_delta >= +10
+        is_topping_table = (my_delta >= 10) and (my_delta > max_opp_delta)
+
+        # 3. Compute Equity scaled for N opponents
+        equity = compute_multiway_equity(your_card, comm_card, recent_hands, num_opps)
+
+        # Relative Equity Multiplier vs Fair Share (Fair Share = 1 / (N + 1))
+        fair_share = 1.0 / (num_opps + 1)
+        equity_ratio = equity / fair_share if fair_share > 0 else 1.0
 
         can_raise = (
             "raise" in legal_actions and min_raise is not None and max_raise is not None
@@ -91,41 +116,45 @@ def showdown():
             "bet" in legal_actions and min_raise is not None and max_raise is not None
         )
 
-        # 1. SCORE PROTECTION: Lock in points once chip_delta >= 25 (+100pt leg threshold)
-        if chip_delta >= 25:
+        # --- DECISION TREE ---
+
+        # RULE A: TOP-THE-TABLE LOCKDOWN
+        # If currently meeting the win condition, minimize risk and protect chips
+        if is_topping_table:
             if "check" in legal_actions:
                 return jsonify({"action": "check"})
             if "call" in legal_actions and to_call <= 2:
                 return jsonify({"action": "call"})
             return jsonify({"action": "fold"})
 
-        # 2. PRE-REVEAL FILTER: Fold low cards to large pre-reveal raises
-        if comm_card is None and to_call > 4 and your_card < 8:
+        # RULE B: PRE-REVEAL MULTIWAY TIGHTENING
+        # In multiway pots (3+ active opponents), fold low cards facing pre-reveal raises
+        if comm_card is None and num_opps >= 2 and to_call > 2 and your_card < 9:
             return jsonify({"action": "fold"})
 
-        # 3. VALUE BETTING / RAISING: Capitalize on strong equity
-        if pessimistic_equity > 0.65 and (can_raise or can_bet):
+        # RULE C: VALUE BETTING & RAISING
+        # Require holding at least 1.4x fair-share equity to open/raise multiway
+        if equity_ratio >= 1.4 and (can_raise or can_bet):
             action = "raise" if can_raise else "bet"
-            fraction = (pessimistic_equity - 0.65) / 0.35
+            fraction = min((equity_ratio - 1.4) / 1.0, 1.0)
             size = int(min_raise + (max_raise - min_raise) * fraction)
             return jsonify(
                 {"action": action, "amount": min(max(size, min_raise), max_raise)}
             )
 
-        # 4. HIGH-BET DEFENSE: Prevent calling station losses
+        # RULE D: POT-ODDS & MULTIWAY CALLING DEFENSE
         if "call" in legal_actions:
             pot_odds = to_call / (pot + to_call) if (pot + to_call) > 0 else 0
 
-            # Require 60%+ proven equity to call big bets (>5 chips)
-            if to_call > 5:
-                if pessimistic_equity >= 0.60:
+            # Require equity advantage when facing bets larger than small blind (2 chips)
+            if to_call > 2:
+                if equity >= pot_odds and equity_ratio >= 1.1:
                     return jsonify({"action": "call"})
             else:
-                # Standard pot-odds call for small bets
-                if pessimistic_equity >= pot_odds:
+                if equity >= pot_odds:
                     return jsonify({"action": "call"})
 
-        # 5. SAFE FALLBACKS
+        # RULE E: DEFAULT SAFE FALLBACK
         if "check" in legal_actions:
             return jsonify({"action": "check"})
 
