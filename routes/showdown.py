@@ -4,6 +4,7 @@ import os
 import sys
 import traceback
 from flask import Flask, jsonify, request
+from routes import app
 
 # Configure clear stdout logging for Cloud logs / ngrok terminals
 logging.basicConfig(
