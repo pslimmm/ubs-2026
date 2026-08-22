@@ -195,7 +195,7 @@ class GraphRiskEngine:
 
 engine = GraphRiskEngine(lookback_hours=24)
 
-@app.route("/evaluate", methods=["POST"])
+@app.route("/ghost-chains/transactions", methods=["POST"])
 def evaluate_transactions():
     """Processes array of incoming transactions sequentially and returns risk scores."""
     payload = request.get_json()
@@ -216,8 +216,8 @@ def evaluate_transactions():
     return jsonify({"results": results}), 200
 
 
-@app.route("/reset", methods=["POST"])
+@app.route("/ghost-chains/reset", methods=["POST"])
 def reset_state():
     """Phase 1 Constraint: Fully resets graph engine state."""
     engine.reset()
-    return jsonify({"status": "success", "message": "Graph state cleared"}), 200
+    return jsonify({"clearTransactions": True }), 200
