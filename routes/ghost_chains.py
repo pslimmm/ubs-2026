@@ -1,4 +1,5 @@
 import heapq
+import math
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -7,6 +8,11 @@ from typing import Dict, Optional, Set, Tuple
 from flask import jsonify, request
 
 from routes import app
+
+
+BASELINE_RISK = 0.05
+RETURN_PATH_WEIGHT = 2.0
+SATURATION_SCALE = 6.0
 
 
 @dataclass(frozen=True)
@@ -80,7 +86,7 @@ class GraphRiskEngine:
     def _advance_window(self, timestamp: datetime) -> datetime:
         self.latest_time = max(self.latest_time or timestamp, timestamp)
         cutoff = self.latest_time - self.lookback
-        while self.history and self.history[0][0] < cutoff:
+        while self.history and self.history[0][0] <= cutoff:
             _, _, expired = heapq.heappop(self.history)
             self._remove_edge(expired.from_user, expired.to_user)
         self.nodes = set(self.adj) | {
@@ -115,15 +121,20 @@ class GraphRiskEngine:
         return visited
 
     def _count_disjoint_paths(self, start: str, target: str, limit: int = 5) -> int:
-        residual = {source: set(targets) for source, targets in self.adj.items()}
+        residual = defaultdict(dict)
+        for source, targets in self.adj.items():
+            for target_node in targets:
+                residual[source][target_node] = 1
+                residual[target_node].setdefault(source, 0)
+
         count = 0
         while count < limit:
             queue = deque([start])
             parent = {start: None}
             while queue and target not in parent:
                 current = queue.popleft()
-                for neighbor in residual.get(current, set()):
-                    if neighbor not in parent:
+                for neighbor in sorted(residual[current]):
+                    if residual[current][neighbor] and neighbor not in parent:
                         parent[neighbor] = current
                         queue.append(neighbor)
             if target not in parent:
@@ -131,35 +142,39 @@ class GraphRiskEngine:
             current = target
             while parent[current] is not None:
                 previous = parent[current]
-                residual[previous].remove(current)
+                residual[previous][current] -= 1
+                residual[current][previous] = residual[current].get(previous, 0) + 1
                 current = previous
             count += 1
         return count
 
     def _structural_score(self, source: str, target: str) -> float:
-        if source == target:
-            return 0.8
+        upstream = self._reachable(source, self.rev) | {source}
+        downstream = self._reachable(target, self.adj) | {target}
+        route_pairs = len(upstream) * len(downstream)
+        parallel_edges = self.adj.get(source, {}).get(target, 0)
 
-        return_distance = self._shortest_path(target, source)
-        common_origins = len(
-            self._reachable(source, self.rev) & self._reachable(target, self.rev)
-        )
-
-        if return_distance is not None:
-            return_paths = self._count_disjoint_paths(target, source)
-            signal = (
-                0.58
-                + 0.10 / return_distance
-                + 0.08 * min(common_origins, 3)
-                + 0.08 * min(return_paths - 1, 2)
-            )
-        elif common_origins:
-            signal = 0.32 + 0.06 * min(common_origins, 3)
-        elif source in self.nodes or target in self.nodes:
-            signal = 0.18
+        if parallel_edges:
+            impact = math.log2(1 + parallel_edges)
         else:
-            signal = 0.05
-        return round(min(signal, 1.0), 4)
+            alternative_origins = upstream & self._reachable(target, self.rev)
+            alternative_pairs = len(alternative_origins) * len(downstream)
+            impact = math.log2(route_pairs) + math.log2(1 + alternative_pairs)
+
+            old_distance = self._shortest_path(source, target)
+            if old_distance and old_distance > 1:
+                impact += (1 - 1 / old_distance) * math.log2(1 + route_pairs)
+
+        if source == target:
+            impact += RETURN_PATH_WEIGHT
+        else:
+            return_distance = self._shortest_path(target, source)
+            if return_distance:
+                return_paths = self._count_disjoint_paths(target, source)
+                impact += RETURN_PATH_WEIGHT * return_paths / return_distance
+
+        score = 1 - (1 - BASELINE_RISK) * math.exp(-impact / SATURATION_SCALE)
+        return round(score, 4)
 
     def _score(self, tx: Transaction) -> float:
         """Extension point for later identity and value signal phases."""
@@ -182,7 +197,7 @@ class GraphRiskEngine:
 
         cutoff = self._advance_window(tx.timestamp)
         score = self._score(tx)
-        if tx.timestamp >= cutoff:
+        if tx.timestamp > cutoff:
             self._add_active(tx)
         self.processed_txs[tx.tx_id] = (tx.signature, score)
         return score
