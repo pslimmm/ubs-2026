@@ -1,0 +1,175 @@
+import unittest
+from unittest.mock import patch
+
+from routes import app
+from routes import showdown as game
+
+
+def payload(**changes):
+    data = {
+        "phase": 2,
+        "table_rule": "onyx",
+        "your_number": 7,
+        "community_number": 7,
+        "to_call": 2,
+        "pot": 10,
+        "legal_actions": ["fold", "call", "raise"],
+        "min_raise_to": 4,
+        "max_raise_to": 200,
+        "your_seat": 0,
+        "hand_number": 1,
+        "total_hands": 40,
+        "big_blind": 2,
+        "players": [
+            {"seat": 0, "name": "you", "chip_delta": 0},
+            {"seat": 1, "name": "bot", "chip_delta": 0},
+        ],
+        "recent_hands": [],
+    }
+    data.update(changes)
+    return data
+
+
+def showdown_hand(number, community, low, high, winner, integer_keys=False):
+    keys = (0, 1) if integer_keys else ("0", "1")
+    return {
+        "hand_number": number,
+        "community_number": community,
+        "shown_numbers": {keys[0]: low, keys[1]: high},
+        "winners": [0 if winner == low else 1],
+    }
+
+
+class ShowdownTests(unittest.TestCase):
+    def setUp(self):
+        game.RULE_KNOWLEDGE_BASE.clear()
+        self.client = app.test_client()
+        self.no_save = patch.object(game, "save_memory")
+        self.no_save.start()
+
+    def tearDown(self):
+        self.no_save.stop()
+
+    def test_phase_one_pre_reveal_equity_includes_future_pair_outcomes(self):
+        self.assertAlmostEqual(
+            game.evaluate_hand_strength(1, None, "standard"),
+            18.5 / 169,
+        )
+        self.assertAlmostEqual(
+            game.evaluate_hand_strength(13, None, "standard"),
+            150.5 / 169,
+        )
+
+    def test_standard_rule_cannot_be_overwritten_by_observations(self):
+        misleading = [showdown_hand(1, 7, 2, 12, winner=2)]
+        game.RULE_KNOWLEDGE_BASE["standard"] = {"7": {"2_12": 2}}
+
+        game.update_rule_knowledge("standard", misleading)
+
+        self.assertEqual(game.compare_hands(2, 12, 7, "standard"), -1)
+
+    def test_hidden_low_card_rule_generalizes_to_unseen_matchups(self):
+        evidence = [
+            showdown_hand(1, 1, 2, 12, winner=2),
+            showdown_hand(2, 13, 3, 11, winner=3, integer_keys=True),
+            showdown_hand(3, 7, 2, 5, winner=2),
+            showdown_hand(4, 4, 6, 10, winner=6),
+        ]
+        game.update_rule_knowledge("onyx", evidence)
+
+        low = game.evaluate_hand_strength(2, 9, "onyx")
+        high = game.evaluate_hand_strength(12, 9, "onyx")
+
+        self.assertGreater(low, high)
+
+    def test_incomplete_showdown_history_is_ignored(self):
+        incomplete = {
+            "community_number": 5,
+            "shown_numbers": {"0": 2, "1": 9},
+            "winners": [],
+        }
+
+        response = self.client.post(
+            "/move", json=payload(recent_hands=[incomplete])
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(response.get_json()["action"], payload()["legal_actions"])
+
+    def test_corrupt_rule_memory_is_recovered(self):
+        game.RULE_KNOWLEDGE_BASE["onyx"] = {
+            "observations": [["bad", "low", "high", "result"]]
+        }
+
+        response = self.client.post("/move", json=payload())
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIsInstance(
+            game.RULE_KNOWLEDGE_BASE["onyx"]["observations"], list
+        )
+        self.assertEqual(game.RULE_KNOWLEDGE_BASE["onyx"]["observations"], [])
+
+    def test_missing_raise_ceiling_falls_back_to_another_legal_action(self):
+        response = self.client.post(
+            "/move",
+            json=payload(max_raise_to=None, legal_actions=["fold", "call", "raise"]),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(response.get_json()["action"], ["fold", "call", "raise"])
+
+    def test_only_legal_action_is_always_returned(self):
+        response = self.client.post(
+            "/move",
+            json=payload(
+                your_number=1,
+                community_number=13,
+                pot=0,
+                to_call=20,
+                legal_actions=["call"],
+                min_raise_to=None,
+                max_raise_to=None,
+            ),
+        )
+
+        self.assertEqual(response.get_json(), {"action": "call"})
+
+    def test_all_in_raise_uses_the_single_legal_amount(self):
+        response = self.client.post(
+            "/move",
+            json=payload(table_rule="standard", min_raise_to=17, max_raise_to=17),
+        )
+
+        self.assertEqual(response.get_json(), {"action": "raise", "amount": 17})
+
+    def test_secured_phase_two_leg_avoids_optional_risk(self):
+        players = payload()["players"]
+        players[0]["chip_delta"] = 30
+
+        response = self.client.post(
+            "/move",
+            json=payload(hand_number=39, players=players),
+        )
+
+        self.assertEqual(response.get_json(), {"action": "fold"})
+
+    def test_committed_chips_are_not_counted_as_a_secured_lead(self):
+        players = payload()["players"]
+        players[0]["chip_delta"] = 30
+
+        response = self.client.post(
+            "/move",
+            json=payload(
+                table_rule="standard",
+                hand_number=40,
+                players=players,
+                starting_stack=200,
+                your_stack=205,
+            ),
+        )
+
+        self.assertEqual(response.get_json()["action"], "raise")
+
+
+if __name__ == "__main__":
+    unittest.main()
