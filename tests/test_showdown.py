@@ -116,7 +116,7 @@ class ShowdownTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
             response.get_json(),
-            {"status": "ok", "showdown_strategy": "phase1-2-v3"},
+            {"status": "ok", "showdown_strategy": "phase1-2-v4"},
         )
 
     def test_corrupt_rule_memory_is_recovered(self):

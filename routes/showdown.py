@@ -16,7 +16,7 @@ CALL_EQUITY = 0.80
 STEAL_EQUITY = 0.35
 NUT_EQUITY = 12.5 / 13
 MAX_CALL_BLINDS = 10
-STRATEGY_VERSION = "phase1-2-v3"
+STRATEGY_VERSION = "phase1-2-v4"
 
 
 def load_memory() -> dict:
