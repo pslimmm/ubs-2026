@@ -10,7 +10,7 @@ from routes import app
 logger = logging.getLogger(__name__)
 
 @app.route('/kan-cheong-delivery-driver', methods=['POST'])
-def solve():
+def kan_cheong_delivery_driver():
     """Accept a JSON request string and return a JSON response string with the fastest route."""
     data = request.get_json()
     logging.info("data sent for evaluation {}".format(data))
