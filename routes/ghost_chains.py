@@ -40,8 +40,9 @@ class Transaction:
             amount=data["amount"],
             timestamp=datetime.fromisoformat(raw_ts),
             ip_address=data.get("ipAddress"),  # Handle missing optionals gracefully
-            device_id=data.get("deviceId")
+            device_id=data.get("deviceId"),
         )
+
 
 class GraphRiskEngine:
     def __init__(self, lookback_hours: int = 24):
@@ -195,6 +196,7 @@ class GraphRiskEngine:
 
 engine = GraphRiskEngine(lookback_hours=24)
 
+
 @app.route("/ghost-chains/transactions", methods=["POST"])
 def evaluate_transactions():
     """Processes array of incoming transactions sequentially and returns risk scores."""
@@ -220,4 +222,9 @@ def evaluate_transactions():
 def reset_state():
     """Phase 1 Constraint: Fully resets graph engine state."""
     engine.reset()
-    return jsonify({"clearTransactions": True }), 200
+    return jsonify({"clearTransactions": True}), 200
+
+
+@app.route("/ghost-chains/health", methods=["GET"])
+def check_health():
+    return jsonify({"status": "ok"}), 200
