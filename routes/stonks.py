@@ -1,6 +1,7 @@
 import heapq
 import itertools
 import logging
+import time
 from dataclasses import dataclass
 
 from flask import jsonify, request
@@ -14,6 +15,7 @@ MAX_SEARCH_STATES = 100_000
 MAX_PROBE_STATES = 250
 MAX_TRADE_STATES = 1_000
 MAX_QUANTITY_CHOICES = 64
+MAX_CASE_SECONDS = 2.0
 
 
 @dataclass(frozen=True)
@@ -68,6 +70,8 @@ def stonks():
 
 
 def solve_case(case, case_number=None):
+    started = time.monotonic()
+    deadline = started + MAX_CASE_SECONDS
     energy, capital, market = _parse(case)
     logger.info(
         "stonks case=%s energy=%d capital=%d years=%s stocks=%d lots=%d exact=%s search_limit=%s",
@@ -87,7 +91,16 @@ def solve_case(case, case_number=None):
     exact = True
     expanded = 0
 
+    timed_out = False
     while queue and (state_limit is None or expanded < state_limit):
+        if time.monotonic() >= deadline:
+            timed_out = True
+            exact = False
+            logger.warning(
+                "stonks case=%s search deadline reached expanded=%d queue=%d",
+                case_number or "?", expanded, len(queue),
+            )
+            break
         neg_bound, _, label = heapq.heappop(queue)
         if -neg_bound <= incumbent.cash or best.get(_key(label)) != (
             label.cash,
@@ -96,7 +109,7 @@ def solve_case(case, case_number=None):
             continue
         expanded += 1
 
-        trades, complete = _trade_options(label, market)
+        trades, complete = _trade_options(label, market, deadline)
         exact &= complete
         logger.debug(
             "stonks case=%s expand year=%d energy=%d cash=%d holdings=%s options=%d complete=%s bound=%d",
@@ -146,12 +159,14 @@ def solve_case(case, case_number=None):
                 year_frontier.append(candidate)
                 heapq.heappush(queue, (-bound, next(counter), candidate))
 
-    exact &= not queue
+    limit_reached = state_limit is not None and expanded >= state_limit and bool(queue)
+    exact &= not queue and not timed_out and not limit_reached
     gap = max(0, root_bound - incumbent.cash)
     logger.info(
-        "stonks case=%s capital=%d final=%d states=%d exact=%s upper_bound=%d upper_gap=%d actions=%d",
+        "stonks case=%s capital=%d final=%d states=%d exact=%s timed_out=%s elapsed_ms=%d upper_bound=%d upper_gap=%d actions=%d",
         case_number or "?", capital, incumbent.cash, expanded, exact,
-        root_bound, 0 if exact else gap, len(incumbent.actions),
+        timed_out, int((time.monotonic() - started) * 1000), root_bound,
+        gap, len(incumbent.actions),
     )
     return list(incumbent.actions)
 
@@ -239,7 +254,7 @@ def _exact_size(energy, years, lots, stock_count):
     return size
 
 
-def _trade_options(label, market):
+def _trade_options(label, market, deadline=None):
     prices = market.prices[label.year]
     original = label.holdings
     states = {(label.used, original): (label.cash, label.actions)}
@@ -247,6 +262,8 @@ def _trade_options(label, market):
 
     # Sell first: at one timestamp all sale proceeds are available for purchases.
     for stock in sorted(prices):
+        if deadline is not None and time.monotonic() >= deadline:
+            return [], False
         held = original[stock]
         if not held:
             continue
@@ -254,7 +271,11 @@ def _trade_options(label, market):
         exact &= complete
         updated = {}
         for (used, holdings), (cash, actions) in states.items():
+            if deadline is not None and time.monotonic() >= deadline:
+                return [], False
             for qty in choices:
+                if deadline is not None and qty % 8 == 0 and time.monotonic() >= deadline:
+                    return [], False
                 values = list(holdings)
                 values[stock] -= qty
                 next_actions = actions
@@ -266,6 +287,8 @@ def _trade_options(label, market):
 
     # Buy after every possible sale portfolio has been generated.
     for stock in sorted(prices):
+        if deadline is not None and time.monotonic() >= deadline:
+            return [], False
         lot_id = market.lot_at.get((label.year, stock))
         if lot_id is None or label.used & (1 << lot_id):
             continue
@@ -275,12 +298,16 @@ def _trade_options(label, market):
         lot = market.lots[lot_id]
         updated = {}
         for (used, holdings), (cash, actions) in states.items():
+            if deadline is not None and time.monotonic() >= deadline:
+                return [], False
             # Selling and rebuying the same fungible stock at one price is dominated.
             sold_here = holdings[stock] < original[stock]
             maximum = 0 if sold_here else min(lot.qty, cash // price)
             choices, complete = _quantities(maximum, market.exact)
             exact &= complete
             for qty in choices:
+                if deadline is not None and qty % 8 == 0 and time.monotonic() >= deadline:
+                    return [], False
                 values = list(holdings)
                 values[stock] += qty
                 next_used = used | ((1 << lot_id) if qty else 0)
