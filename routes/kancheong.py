@@ -1,27 +1,32 @@
-import json
-import logging
 import heapq
-import bisect
-from datetime import datetime, timezone
-from flask import request
+import logging
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+
+from flask import jsonify, request
 
 from routes import app
 
 logger = logging.getLogger(__name__)
+EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+INFINITY = Decimal("Infinity")
+
 
 @app.route('/kan-cheong-delivery-driver', methods=['POST'])
 def kan_cheong_delivery_driver():
-    """Accept a JSON request string and return a JSON response string with the fastest route."""
-    data = request.get_json()
-    logging.info("data sent for evaluation {}".format(data))
+    """Return the fastest route for every independent case in the request batch."""
+    batch = request.get_json()
+    logging.info("data sent for evaluation %s", batch)
+    return jsonify({case_id: solve_case(data) for case_id, data in batch.items()})
+
+
+def solve_case(data):
     if data["start_coordinate"] == data["end_coordinate"]:
-        return json.dumps(
-            {
-                "total_duration_sec": 0,
-                "arrival_time": data["start_time"],
-                "path": [],
-            }
-        )
+        return {
+            "total_duration_sec": 0,
+            "arrival_time": data["start_time"],
+            "path": [],
+        }
 
     src = tuple(data["start_coordinate"])
     end = tuple(data["end_coordinate"])
@@ -30,48 +35,41 @@ def kan_cheong_delivery_driver():
     graph = build_graph(data["nodes"], data["edges"])
     obstructions = data["obstructions"]
 
-    # Collect all unique obstruction start and end times that are after start_time
-    transition_times = {time_sec}
+    obstruction_end_times = []
     for obs in obstructions:
-        t_start = parse_time(obs["start_time"])
         t_end = parse_time(obs["end_time"])
-        if t_start is not None and t_start > time_sec:
-            transition_times.add(t_start)
-        if t_end is not None and t_end > time_sec:
-            transition_times.add(t_end)
-
-    partitions = sorted(list(transition_times))
+        if t_end is not None:
+            obstruction_end_times.append(t_end)
+    dynamic_until = max(obstruction_end_times, default=time_sec)
 
     # Priority queue stores: (curr_time, curr_node, path_edges)
     pq = [(time_sec, src, [])]
 
-    # visited maps node -> {interval_index: min_arrival_time}
-    visited = {}
+    # Before all obstructions end, later visits to the same node can be useful:
+    # cycling is the only legal way to consume time. Once the network is static,
+    # the usual earliest-arrival dominance rule is safe again.
+    dynamic_labels = set()
+    static_best = {}
 
     while pq:
         curr_time, curr_node, path = heapq.heappop(pq)
 
         if curr_node == end:
-            return json.dumps(
-                {
-                    "total_duration_sec": int(round(curr_time - time_sec)),
-                    "arrival_time": parse_time(int(round(curr_time)), iso_to_sec=False),
-                    "path": path,
-                }
-            )
+            return {
+                "total_duration_sec": json_number(curr_time - time_sec),
+                "arrival_time": parse_time(curr_time, iso_to_sec=False),
+                "path": path,
+            }
 
-        interval_index = get_partition_index(partitions, curr_time)
-
-        if curr_node in visited:
-            if (
-                interval_index in visited[curr_node]
-                and visited[curr_node][interval_index] <= curr_time
-            ):
+        if curr_time < dynamic_until:
+            label = (curr_node, curr_time)
+            if label in dynamic_labels:
                 continue
+            dynamic_labels.add(label)
         else:
-            visited[curr_node] = {}
-
-        visited[curr_node][interval_index] = curr_time
+            if static_best.get(curr_node, INFINITY) <= curr_time:
+                continue
+            static_best[curr_node] = curr_time
 
         if curr_node not in graph:
             continue
@@ -83,13 +81,11 @@ def kan_cheong_delivery_driver():
             if arrival is not None:
                 heapq.heappush(pq, (arrival, neighbor, path + [edge_id]))
 
-    return json.dumps(
-        {
-            "total_duration_sec": None,
-            "arrival_time": None,
-            "path": [],
-        }
-    )
+    return {
+        "total_duration_sec": None,
+        "arrival_time": None,
+        "path": [],
+    }
 
 
 def build_graph(nodes, edges):
@@ -108,12 +104,6 @@ def build_graph(nodes, edges):
     return graph
 
 
-def get_partition_index(partitions, t):
-    # Find the interval [partitions[i], partitions[i+1]) containing t
-    idx = bisect.bisect_right(partitions, t) - 1
-    return max(0, idx)
-
-
 def get_travel_time(edge_id, u, v, t_start, base_duration, obstructions):
     # Filter and pre-parse obstructions for this edge in this direction
     matching_obs = []
@@ -126,27 +116,28 @@ def get_travel_time(edge_id, u, v, t_start, base_duration, obstructions):
             t_start_parsed = parse_time(obs["start_time"])
             t_end_parsed = parse_time(obs["end_time"])
             if t_start_parsed is not None and t_end_parsed is not None:
-                matching_obs.append({
-                    "start": t_start_parsed,
-                    "end": t_end_parsed,
-                    "speed_factor": obs["speed_factor"]
-                })
+                matching_obs.append(
+                    {
+                        "start": t_start_parsed,
+                        "end": t_end_parsed,
+                        "speed_factor": Decimal(str(obs["speed_factor"])),
+                    }
+                )
 
+    def speed_factor_at(time):
+        return min(
+            (
+                obs["speed_factor"]
+                for obs in matching_obs
+                if obs["start"] <= time < obs["end"]
+            ),
+            default=Decimal(1),
+        )
+
+    if speed_factor_at(t_start) == 0:
+        return None
     if base_duration == 0:
-        # Check if it is blocked at t_start
-        active_sfs = [
-            obs["speed_factor"] for obs in matching_obs
-            if obs["start"] <= t_start <= obs["end"]
-        ]
-        return None if (active_sfs and min(active_sfs) == 0.0) else t_start
-
-    # Helper to determine active speed factor in the interval [t_curr, t_next)
-    def get_speed_factor(t_curr, t_next):
-        active_sfs = [
-            obs["speed_factor"] for obs in matching_obs
-            if obs["start"] <= t_curr and (obs["end"] >= t_next if t_next != float("inf") else obs["end"] > t_curr)
-        ]
-        return min(active_sfs) if active_sfs else 1.0
+        return t_start
 
     # Collect all transition times for this edge after t_start
     transitions = {t_start}
@@ -157,20 +148,21 @@ def get_travel_time(edge_id, u, v, t_start, base_duration, obstructions):
             transitions.add(obs["end"])
 
     T = sorted(list(transitions))
-    T.append(float("inf"))
+    T.append(INFINITY)
 
     # Simulate traversal using remaining base duration
-    remaining_duration = float(base_duration)
+    remaining_duration = Decimal(str(base_duration))
     curr_time = t_start
 
     for i in range(len(T) - 1):
         t_curr, t_next = T[i], T[i + 1]
-        sf = get_speed_factor(t_curr, t_next)
+        sf = speed_factor_at(t_curr)
 
-        if sf == 0.0:
-            return None  # Traversal is blocked
+        if sf == 0:
+            curr_time = t_next
+            continue
 
-        if t_next == float("inf"):
+        if t_next == INFINITY:
             # We must finish in this final, obstruction-free interval
             return curr_time + remaining_duration / sf
 
@@ -188,17 +180,23 @@ def get_travel_time(edge_id, u, v, t_start, base_duration, obstructions):
 
 
 def parse_time(time, iso_to_sec=True):
-    if iso_to_sec:
-        try:
-            return int(datetime.fromisoformat(time).timestamp())
-        except:
-            return None
-    else:
-        try:
-            return (
-                datetime.fromtimestamp(time, tz=timezone.utc)
-                .isoformat()
-                .replace("+00:00", "Z")
-            )
-        except:
-            return None
+    try:
+        if iso_to_sec:
+            moment = datetime.fromisoformat(time)
+            if moment.tzinfo is None:
+                moment = moment.replace(tzinfo=timezone.utc)
+            delta = moment.astimezone(timezone.utc) - EPOCH
+            return Decimal(delta.days * 86400 + delta.seconds) + Decimal(
+                delta.microseconds
+            ) / Decimal(1_000_000)
+
+        microseconds = int((time * Decimal(1_000_000)).to_integral_value())
+        return (EPOCH + timedelta(microseconds=microseconds)).isoformat().replace(
+            "+00:00", "Z"
+        )
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def json_number(value):
+    return int(value) if value == value.to_integral_value() else float(value)
