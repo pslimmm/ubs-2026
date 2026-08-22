@@ -1,5 +1,6 @@
 import heapq
 import logging
+import math
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -197,9 +198,15 @@ class GraphRiskEngine:
         if source == target:
             return 0.8
 
+        parallel_edges = self.adj.get(source, {}).get(target, 0)
+        if parallel_edges:
+            repeat_signal = 0.18 + 0.02 * parallel_edges / (parallel_edges + 1)
+            return round(repeat_signal, 4)
+
         return_distance = self._shortest_path(target, source)
+        upstream = self._reachable(source, self.rev)
         common_origins = len(
-            self._reachable(source, self.rev) & self._reachable(target, self.rev)
+            upstream & self._reachable(target, self.rev)
         )
 
         if return_distance:
@@ -213,7 +220,16 @@ class GraphRiskEngine:
         elif common_origins:
             signal = 0.32 + 0.06 * min(common_origins, 3)
         elif source in self.nodes or target in self.nodes:
-            signal = 0.18
+            downstream = self._reachable(target, self.adj)
+            route_pairs = (len(upstream) + 1) * (len(downstream) + 1)
+            impact = 0.025 * math.log2(route_pairs)
+
+            if source in self.nodes and target in self.nodes:
+                forward_distance = self._shortest_path(source, target)
+                if forward_distance:
+                    impact += 0.04 + 0.02 * (1 - 1 / forward_distance)
+
+            signal = min(0.18 + impact, 0.31)
         else:
             signal = 0.05
         return round(min(signal, 1.0), 4)
