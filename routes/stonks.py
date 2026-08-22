@@ -12,6 +12,47 @@ FINAL_YEAR = 2037
 logger = logging.getLogger(__name__)
 
 
+def _best_purchases(cash, candidates):
+    """Choose the bounded set of purchases with the highest eventual value."""
+    if cash <= 0 or not candidates:
+        return cash, []
+
+    dp = [-1] * (cash + 1)
+    dp[0] = 0
+    parents = []
+    for sale_price, buy_price, name, available in candidates:
+        next_dp = dp[:]
+        parent = {}
+        max_quantity = min(int(available), cash // buy_price)
+        for spent, proceeds in enumerate(dp):
+            if proceeds < 0:
+                continue
+            for quantity in range(1, max_quantity + 1):
+                new_spent = spent + quantity * buy_price
+                if new_spent > cash:
+                    break
+                new_proceeds = proceeds + quantity * sale_price
+                if new_proceeds > next_dp[new_spent]:
+                    next_dp[new_spent] = new_proceeds
+                    parent[new_spent] = (spent, quantity)
+        dp = next_dp
+        parents.append(parent)
+
+    best_spent = max(range(cash + 1), key=lambda spent: dp[spent] + cash - spent)
+    best_value = dp[best_spent] + cash - best_spent
+    purchases = []
+    spent = best_spent
+    for index in range(len(candidates) - 1, -1, -1):
+        previous = parents[index].get(spent)
+        if previous is None:
+            continue
+        old_spent, quantity = previous
+        sale_price, buy_price, name, _ = candidates[index]
+        purchases.append((name, buy_price, quantity, sale_price))
+        spent = old_spent
+    return best_value, list(reversed(purchases))
+
+
 def _future_maxima(timeline, years):
     result = {}
     best = {}
@@ -78,19 +119,19 @@ def solve_case(case):
             later_price, later_year = future.get((year, name), (price, year))
             if quantity > 0 and later_year > year and later_price > price:
                 candidates.append((later_price, price, name, quantity))
-        # Exact ratio comparison avoids floating point errors for large prices.
-        candidates.sort(key=lambda item: (item[0] / item[1], item[0]), reverse=True)
-
-        for _, price, name, available in candidates:
-            quantity = min(available, cash // price)
-            if quantity <= 0:
-                continue
+        optimized_cash, purchases = _best_purchases(cash, candidates)
+        for name, price, quantity, sale_price in purchases:
             cash -= quantity * price
             holdings[name].append((quantity, price))
             actions_by_year[year].append(("b", name, quantity))
             logger.info(
                 "stonks buy year=%s stock=%s quantity=%s price=%s cash=%s expected_sale=%s",
-                year, name, quantity, price, cash, later_price,
+                year, name, quantity, price, cash, sale_price,
+            )
+        if purchases:
+            logger.info(
+                "stonks allocation year=%s after_purchase_cash=%s projected_value=%s",
+                year, cash, optimized_cash,
             )
 
     action_years = sorted(actions_by_year)
