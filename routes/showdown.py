@@ -1,126 +1,65 @@
-import json
 import logging
-import os
 import sys
-import traceback
+
 from flask import Flask, jsonify, request
+
 from routes import app
 
-# Configure clear stdout logging for Cloud logs / ngrok terminals
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger(__name__)
 
-MEMORY_FILE = "rule_hypotheses.json"
 
-# Rule evaluator functions
-def score_standard(c1, c2, comm):
-    p1, p2 = (c1 == comm), (c2 == comm)
-    return 1 if (p1, c1) > (p2, c2) else (-1 if (p1, c1) < (p2, c2) else 0)
+def compute_pessimistic_equity(
+    your_card: int, comm_card: int | None, recent_hands: list
+) -> float:
+    """Dynamically builds card dominance graph from recent_hands and calculates equity on-the-fly."""
+    # Pre-reveal fallback (standard card value baseline)
+    if comm_card is None or your_card is None:
+        return (your_card - 1 + 0.5) / 13.0 if your_card else 0.5
 
-def score_lowball(c1, c2, comm):
-    p1, p2 = (c1 == comm), (c2 == comm)
-    return 1 if (p1, -c1) > (p2, -c2) else (-1 if (p1, -c1) < (p2, -c2) else 0)
+    # 1. Initialize 14x14 adjacency matrix (cards 1 to 13)
+    matrix = [[False] * 14 for _ in range(14)]
 
-def score_closest(c1, c2, comm):
-    d1, d2 = abs(c1 - comm), abs(c2 - comm)
-    return 1 if d1 < d2 else (-1 if d1 > d2 else 0)
-
-def score_furthest(c1, c2, comm):
-    d1, d2 = abs(c1 - comm), abs(c2 - comm)
-    return 1 if d1 > d2 else (-1 if d1 > d2 else 0)
-
-def score_odd_even(c1, c2, comm):
-    k1 = (c1 % 2 != 0, c1 == comm, c1)
-    k2 = (c2 % 2 != 0, c2 == comm, c2)
-    return 1 if k1 > k2 else (-1 if k1 < k2 else 0)
-
-RULE_CANDIDATES = {
-    "standard": score_standard,
-    "lowball": score_lowball,
-    "closest": score_closest,
-    "furthest": score_furthest,
-    "odd_even": score_odd_even
-}
-
-def get_rule_scores(table_rule: str) -> dict:
-    if os.path.exists(MEMORY_FILE):
-        try:
-            with open(MEMORY_FILE, "r") as f:
-                data = json.load(f)
-                if table_rule in data:
-                    return data[table_rule]
-        except Exception as e:
-            logger.error(f"Failed to read memory file: {e}")
-    return {name: 1.0 for name in RULE_CANDIDATES}
-
-def update_hypotheses(table_rule: str, recent_hands: list):
-    if not recent_hands:
-        return
-
-    scores = get_rule_scores(table_rule)
-    updated = False
-
+    # 2. Extract direct showdown outcomes for THIS community card
     for hand in recent_hands:
         shown = hand.get("shown_numbers", {})
         winners = hand.get("winners", [])
-        comm = hand.get("community_number")
+        hand_comm = hand.get("community_number")
 
-        if len(shown) == 2 and comm is not None:
+        # Only process hands that reached showdown with the matching community card
+        if hand_comm == comm_card and len(shown) == 2 and len(winners) == 1:
             c0, c1 = shown.get("0"), shown.get("1")
-            if c0 is None or c1 is None or c0 == c1:
-                continue
+            if c0 is not None and c1 is not None and c0 != c1:
+                winner_seat = str(winners[0])
+                winner_card = shown.get(winner_seat)
+                loser_card = c1 if winner_card == c0 else c0
+                if winner_card and loser_card:
+                    matrix[winner_card][loser_card] = True
 
-            actual_res = 0 if len(winners) > 1 else (1 if winners[0] == 0 else -1)
+    # 3. Transitive Closure (Floyd-Warshall over 13 cards)
+    for k in range(1, 14):
+        for i in range(1, 14):
+            for j in range(1, 14):
+                if matrix[i][k] and matrix[k][j]:
+                    matrix[i][j] = True
 
-            for name, fn in RULE_CANDIDATES.items():
-                if scores[name] > 0:
-                    pred = fn(c0, c1, comm)
-                    if pred != actual_res:
-                        logger.info(f"Rule rule '{table_rule}': Eliminating hypothesis '{name}' based on hand outcome.")
-                        scores[name] = 0.0
-                        updated = True
+    # 4. Count proven wins for your card
+    must_wins = sum(
+        1 for opp in range(1, 14) if opp != your_card and matrix[your_card][opp]
+    )
 
-    if updated:
-        try:
-            all_data = {}
-            if os.path.exists(MEMORY_FILE):
-                with open(MEMORY_FILE, "r") as f:
-                    all_data = json.load(f)
-            all_data[table_rule] = scores
-            with open(MEMORY_FILE, "w") as f:
-                json.dump(all_data, f, indent=2)
-            logger.info(f"Updated rule memory saved for rule: {table_rule}")
-        except Exception as e:
-            logger.error(f"Failed to write memory file: {e}")
+    # Lower-bound equity (treats unobserved comparisons as non-wins)
+    return (must_wins + 0.5) / 13.0
 
-def evaluate_strength(your_card: int, comm: int | None, table_rule: str) -> tuple[float, bool]:
-    scores = get_rule_scores(table_rule)
-    active_rules = [name for name, score in scores.items() if score > 0]
-    is_confident = len(active_rules) == 1
-
-    if comm is None:
-        return (your_card - 1 + 0.5) / 13.0, is_confident
-
-    total_wins = 0
-    total_evals = 0
-
-    for rule_name in active_rules:
-        fn = RULE_CANDIDATES[rule_name]
-        for opp_card in range(1, 14):
-            res = fn(your_card, opp_card, comm)
-            total_wins += 1.0 if res > 0 else (0.5 if res == 0 else 0.0)
-            total_evals += 1
-
-    win_prob = (total_wins / total_evals) if total_evals > 0 else 0.5
-    return win_prob, is_confident
 
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"}), 200
+
 
 @app.route("/move", methods=["POST"])
 def showdown():
@@ -128,69 +67,70 @@ def showdown():
     legal_actions = data.get("legal_actions", ["check", "fold"])
 
     try:
-        # Extract variables with logging
-        hand_num = data.get("hand_number")
-        leg_num = data.get("leg_number", 1)
-        round_phase = data.get("round")
-        table_rule = data.get("table_rule", "standard")
         your_card = data.get("your_number")
         comm_card = data.get("community_number")
         to_call = data.get("to_call", 0)
         pot = data.get("pot", 0)
         min_raise = data.get("min_raise_to")
         max_raise = data.get("max_raise_to")
+        recent_hands = data.get("recent_hands", [])
 
-        logger.info(f"--- Leg {leg_num} | Hand #{hand_num} ({round_phase}) | Rule: '{table_rule}' ---")
-        logger.info(f"Your Card: {your_card} | Comm Card: {comm_card} | Pot: {pot} | To Call: {to_call}")
+        # Extract current score delta to protect leads
+        me = next((p for p in data.get("players", []) if p.get("name") == "you"), {})
+        chip_delta = me.get("chip_delta", 0)
 
-        # Update knowledge base
-        update_hypotheses(table_rule, data.get("recent_hands", []))
+        # Calculate equity strictly using the current payload's recent_hands
+        pessimistic_equity = compute_pessimistic_equity(
+            your_card, comm_card, recent_hands
+        )
 
-        # Evaluate hand equity
-        win_prob, is_confident = evaluate_strength(your_card, comm_card, table_rule)
-        logger.info(f"Win Prob: {win_prob:.2f} | Confident in Rule: {is_confident}")
+        can_raise = (
+            "raise" in legal_actions and min_raise is not None and max_raise is not None
+        )
+        can_bet = (
+            "bet" in legal_actions and min_raise is not None and max_raise is not None
+        )
 
-        # Risk Management: Reduce aggressiveness pre-reveal if rule unknown
-        if not is_confident and comm_card is None:
-            win_prob = min(win_prob, 0.5)
-
-        can_raise = "raise" in legal_actions and min_raise is not None and max_raise is not None
-        can_bet = "bet" in legal_actions and min_raise is not None and max_raise is not None
-
-        response = {}
-
-        # 1. High Equity: Value Raise / Bet
-        if win_prob > 0.70 and (can_raise or can_bet):
-            action = "raise" if can_raise else "bet"
-            fraction = (win_prob - 0.70) / 0.30
-            size = int(min_raise + (max_raise - min_raise) * fraction)
-            size = min(max(size, min_raise), max_raise)
-            response = {"action": action, "amount": size}
-
-        # 2. Moderate Equity: Open bet
-        elif win_prob > 0.55 and can_bet:
-            response = {"action": "bet", "amount": min_raise}
-
-        # 3. Pot-Odds Call
-        elif "call" in legal_actions:
-            pot_odds = to_call / (pot + to_call) if (pot + to_call) > 0 else 0
-            if win_prob >= pot_odds:
-                response = {"action": "call"}
-
-        # 4. Fallbacks
-        if not response:
+        # 1. SCORE PROTECTION: Lock in points once chip_delta >= 25 (+100pt leg threshold)
+        if chip_delta >= 25:
             if "check" in legal_actions:
-                response = {"action": "check"}
-            else:
-                response = {"action": "fold"}
+                return jsonify({"action": "check"})
+            if "call" in legal_actions and to_call <= 2:
+                return jsonify({"action": "call"})
+            return jsonify({"action": "fold"})
 
-        logger.info(f"Chosen Action: {response}")
-        return jsonify(response)
+        # 2. PRE-REVEAL FILTER: Fold low cards to large pre-reveal raises
+        if comm_card is None and to_call > 4 and your_card < 8:
+            return jsonify({"action": "fold"})
+
+        # 3. VALUE BETTING / RAISING: Capitalize on strong equity
+        if pessimistic_equity > 0.65 and (can_raise or can_bet):
+            action = "raise" if can_raise else "bet"
+            fraction = (pessimistic_equity - 0.65) / 0.35
+            size = int(min_raise + (max_raise - min_raise) * fraction)
+            return jsonify(
+                {"action": action, "amount": min(max(size, min_raise), max_raise)}
+            )
+
+        # 4. HIGH-BET DEFENSE: Prevent calling station losses
+        if "call" in legal_actions:
+            pot_odds = to_call / (pot + to_call) if (pot + to_call) > 0 else 0
+
+            # Require 60%+ proven equity to call big bets (>5 chips)
+            if to_call > 5:
+                if pessimistic_equity >= 0.60:
+                    return jsonify({"action": "call"})
+            else:
+                # Standard pot-odds call for small bets
+                if pessimistic_equity >= pot_odds:
+                    return jsonify({"action": "call"})
+
+        # 5. SAFE FALLBACKS
+        if "check" in legal_actions:
+            return jsonify({"action": "check"})
+
+        return jsonify({"action": "fold"})
 
     except Exception as e:
-        # Crash prevention: Return a safe legal move to avoid timeouts or forfeits
-        logger.error(f"Unhandled exception in /move: {e}")
-        logger.error(traceback.format_exc())
-        fallback_action = "check" if "check" in legal_actions else "fold"
-        logger.warning(f"Returning safe fallback action: {fallback_action}")
-        return jsonify({"action": fallback_action})
+        logger.error(f"Fallback triggered by error: {e}")
+        return jsonify({"action": "check" if "check" in legal_actions else "fold"})
