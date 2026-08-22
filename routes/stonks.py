@@ -1,7 +1,9 @@
 import heapq
 import itertools
 import logging
-import time
+import math
+from array import array
+from collections import deque
 from dataclasses import dataclass
 import collections
 
@@ -9,14 +11,13 @@ from flask import jsonify, request
 
 from routes import app
 
-logger = logging.getLogger(__name__)
-
 HOME = 2037
 MAX_SEARCH_STATES = 100_000
 MAX_PROBE_STATES = 250
-MAX_TRADE_STATES = 1_000
-MAX_QUANTITY_CHOICES = 64
-MAX_CASE_SECONDS = 2.0
+MAX_KNAPSACK_CAPACITY = 50_000
+MAX_KNAPSACK_CELLS = 1_000_000
+MAX_KNAPSACK_REQUEST_CELLS = 2_000_000
+MAX_PROBE_CHOICES = 8
 
 
 @dataclass(frozen=True)

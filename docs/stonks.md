@@ -66,18 +66,23 @@ has no less cash or holdings, no more energy use, and no more consumed inventory
 
 Search uses an admissible upper bound that grants free travel, liquidation at each
 stock's global maximum price, and every remaining stock-year's maximum possible
-profit. A max-priority queue explores the highest-bound labels first. A branch is
-discarded if it cannot return to 2037 or cannot beat the incumbent solution.
+profit. A branch is discarded if it cannot return to 2037 or cannot beat the
+incumbent solution. Probe mode explores labels with the greatest optimistic
+mark-to-market portfolio value first so complete compounding routes are not starved
+by loose bounds on unfunded inventory.
 
 Before searching, the solver estimates the complete DP state space from energy,
 reachable years, inventories, and maximum holdings. Cases whose estimate is at most
 100,000 are exact mode: every integer quantity is enumerated, local frontiers are
 never truncated, and search continues until the queue is exhausted. Other cases use
-a 250-state optimum probe. Quantities above 64 are then sampled at boundaries, small
-quantities, complements, and quartiles, while large local frontiers retain the 1,000
-states with the greatest reachable optimistic value. These limits keep the endpoint
-responsive. The best valid route is always returned, and the server logs whether
-exhaustive optimality was proven plus the remaining optimistic gap when it was not.
+a 250-state optimum probe. Each visit considers bounded, economically meaningful
+choices: hold or liquidate the portfolio, selective full-stock sales, the eight best
+single-stock purchases, and an optimized bounded-knapsack purchase portfolio. The
+knapsack residual is exact within a 50,000 scaled-capital, 1,000,000-cell portfolio,
+and 2,000,000-cell case budget; work beyond those limits uses profit-density bulk
+allocation. These limits keep the endpoint responsive. The best valid route is always
+returned, and the server logs whether exhaustive optimality was proven plus the
+remaining optimistic gap when it was not.
 
 Output is deterministic and prioritizes maximum final cash. Because the wire grammar
 uses hyphens as separators, stock names must be non-empty and cannot contain hyphens;
