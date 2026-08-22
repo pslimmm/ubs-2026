@@ -7,6 +7,8 @@ from flask import jsonify, request
 
 from routes import app
 
+logger = logging.getLogger(__name__)
+
 HOME = 2037
 MAX_SEARCH_STATES = 100_000
 MAX_PROBE_STATES = 250
@@ -46,17 +48,32 @@ class Label:
 @app.route("/stonks", methods=["POST"])
 def stonks():
     batch = request.get_json(silent=True)
+    logger.info(
+        "stonks request remote=%s content_length=%s cases=%s",
+        request.remote_addr,
+        request.content_length,
+        len(batch) if isinstance(batch, list) else None,
+    )
     if not isinstance(batch, list):
+        logger.warning("stonks invalid request: expected an array")
         return jsonify({"error": "Invalid request"}), 400
 
     try:
-        return jsonify([solve_case(case) for case in batch])
+        result = [solve_case(case, index) for index, case in enumerate(batch, 1)]
+        logger.info("stonks response cases=%d", len(result))
+        return jsonify(result)
     except (KeyError, TypeError, ValueError):
+        logger.exception("stonks invalid case payload")
         return jsonify({"error": "Invalid request"}), 400
 
 
-def solve_case(case):
+def solve_case(case, case_number=None):
     energy, capital, market = _parse(case)
+    logger.info(
+        "stonks case=%s energy=%d capital=%d years=%s stocks=%d lots=%d exact=%s search_limit=%s",
+        case_number or "?", energy, capital, market.years, len(market.stocks),
+        len(market.lots), market.exact, _state_limit(market) or "unlimited",
+    )
     holdings = (0,) * len(market.stocks)
     start = Label(HOME, 0, capital, 0, holdings, ())
     incumbent = start
@@ -81,9 +98,19 @@ def solve_case(case):
 
         trades, complete = _trade_options(label, market)
         exact &= complete
+        logger.debug(
+            "stonks case=%s expand year=%d energy=%d cash=%d holdings=%s options=%d complete=%s bound=%d",
+            case_number or "?", label.year, label.energy, label.cash,
+            label.holdings, len(trades), complete, -neg_bound,
+        )
         for traded in trades:
             if traded.year == HOME and _better_terminal(traded, incumbent):
                 incumbent = traded
+                logger.info(
+                    "stonks case=%s incumbent cash=%d energy=%d actions=%d",
+                    case_number or "?", incumbent.cash, incumbent.energy,
+                    len(incumbent.actions),
+                )
 
             for year in market.years:
                 if year == traded.year:
@@ -121,13 +148,10 @@ def solve_case(case):
 
     exact &= not queue
     gap = max(0, root_bound - incumbent.cash)
-    logging.info(
-        "stonks capital=%d final=%d states=%d exact=%s upper_gap=%d",
-        capital,
-        incumbent.cash,
-        expanded,
-        exact,
-        0 if exact else gap,
+    logger.info(
+        "stonks case=%s capital=%d final=%d states=%d exact=%s upper_bound=%d upper_gap=%d actions=%d",
+        case_number or "?", capital, incumbent.cash, expanded, exact,
+        root_bound, 0 if exact else gap, len(incumbent.actions),
     )
     return list(incumbent.actions)
 
