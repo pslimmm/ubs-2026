@@ -12,10 +12,6 @@ This challenge is released in three cumulative phases.
 
 Each phase's evaluation re-tests the requirements of every earlier phase within the same evaluation run. A Phase 2 evaluation therefore re-checks Phase 1 behaviour, and a Phase 3 evaluation re-checks Phases 1 and 2 behaviour. Extend your system without breaking what already works.
 
-### Phases Schedule
-
-Start with Phase 1 only. Phases 2 and 3 are unlocked during the event — ignore them until announced. When they arrive, extend your system without breaking what already works.
-
 ### Scoring Overview
 
 You do not need to match an absolute “correct” score for each transaction. You need a coherent model that consistently ranks suspicious activity above ordinary flow.
@@ -203,6 +199,127 @@ STRUCTURAL_DEVIATION: Moderate, TEMPORAL_DEVIATION: Low
 
 ---
 
+## Overview
+
+Criminal networks move billions through ordinary financial systems every year. They use digital assets, real-time payments, capital markets and seemingly legitimate accounts in an almost invisible money trail — flickering with the rhythmic taps on a screen.
+
+As transactions arrive continuously, systems that rely on full historical recomputation cannot keep pace. Risk must be assessed incrementally as each transaction arrives, using only prior information.
+
+## Your Mission
+
+Build a real-time risk scoring service that assigns a risk score to each incoming transaction based on an evolving graph.
+
+The dataset is synthetic but designed to reflect realistic financial behaviour. The goal is to detect coordinated activity as it emerges, while minimizing false positives on ordinary business transactions.
+
+Entity names in the examples are synthetic and chosen to resemble counterparties that often appear in trade-based or layering typologies (holding companies, logistics fronts, payment intermediaries, and import/export shells).
+
+---
+
+## Phase 1 - Follow the Money (Structural Signal)
+
+### Phase 1 Briefing
+
+In plain terms: watch how money moves between entities. A lonely Meridian Holdings $\rightarrow$ Apex Logistics transaction is usually boring. Money that travels onward, fans into the same destination, or — especially — loops back through entities you have already seen is more interesting.
+
+Your task is to assign a higher risk score to transactions that increase this structural signal.
+
+### Core Principle
+
+Each incoming transaction updates a directed graph of entities.
+
+Risk score reflects how the transaction changes the graph's structural signal: the combined effect of new or shortened paths between entities, not any single graph feature. A higher risk score corresponds to a greater increase in the graph's capacity to support recurring flow. Edge cases the examples do not cover (for example degenerate or repeated edges) are left open — reason from the principle above.
+
+### Phase 1 Objectives
+
+* Apply structural signal-based scoring
+* Maintain consistent streaming graph state under Phase 1 rules
+
+### Phase 1 Constraints Checklist
+
+These cover how your service runs and responds. The scoring model is described above.
+
+| Constraint | Expectation |
+| :--- | :--- |
+| **Score range** | $0.0 \le \text{riskScore} \le 1.0$ |
+| **Lookback** | Active history is the most recent 24 hours |
+| **Batch processing** | Process request array in order; preserve response order |
+| **Idempotency** | Duplicate `txId` $\rightarrow$ original score, no state mutation |
+| **Missing optionals** | Absent `ipAddress` / `deviceId` must not cause failure |
+| **Unknown fields** | Ignore gracefully |
+| **Reset** | Must fully clear graph / derived state |
+
+*Later phases introduce additional signals; behaviours not covered here are left for you to reason about.*
+
+### Evasion via missing identity
+
+Later phases may treat a change in optional identity fields as a signal — in particular, a flow that carries a network address or device identifier on some legs and stops carrying it on a later connected leg. Absence on isolated transactions is not suspicious; absence where a connected flow previously carried the attribute may be an attempt to break the trail. Design your identity handling so present and absent fields are both observable states.
+
+### Phase 1 Examples
+
+These examples show transaction sequences from first to last. Assume that the preceding transactions have already been scored, and that the final transaction is now being evaluated.
+
+#### Example 1 - Isolated
+
+* Meridian Holdings $\rightarrow$ Apex Logistics
+
+**Interpretation:**
+A single entity-to-entity transaction has occurred. No network pattern has emerged yet.
+
+#### Example 2 - Extension
+
+* Meridian Holdings $\rightarrow$ Apex Logistics
+* Apex Logistics $\rightarrow$ Cascade Payments
+
+**Interpretation:**
+Funds move onward from Apex Logistics to a new counterparty. The network is growing in a single direction along a plausible commercial payment chain.
+
+#### Example 3 - Convergence
+
+* Meridian Holdings $\rightarrow$ Apex Logistics
+* Meridian Holdings $\rightarrow$ Horizon Capital
+* Apex Logistics $\rightarrow$ Sterling Bridge
+* Horizon Capital $\rightarrow$ Sterling Bridge
+
+**Interpretation:**
+Two separate paths from Meridian Holdings arrive at the same destination. Sterling Bridge is now reachable from Meridian Holdings via more than one route.
+Convergence is an intermediate structural signal: stronger than simple extension, but not necessarily as suspicious as a return path.
+
+#### Example 4 - Return
+
+* Meridian Holdings $\rightarrow$ Apex Logistics
+* Apex Logistics $\rightarrow$ Cascade Payments
+* Cascade Payments $\rightarrow$ Oakridge Imports
+* Oakridge Imports $\rightarrow$ Apex Logistics
+
+**Interpretation:**
+Oakridge Imports sends funds back to Apex Logistics — a counterparty that earlier sat upstream of Oakridge Imports. Money has begun moving back toward an earlier part of the network.
+
+#### Example 5 - Multi-Loop
+
+* Meridian Holdings $\rightarrow$ Apex Logistics
+* Apex Logistics $\rightarrow$ Cascade Payments
+* Cascade Payments $\rightarrow$ Meridian Holdings
+* Apex Logistics $\rightarrow$ Nimbus Trading
+* Nimbus Trading $\rightarrow$ Meridian Holdings
+
+**Interpretation:**
+Meridian Holdings receives funds via two separate return routes through the same network. Multiple flows have converged back toward the origin.
+
+### Expected Ordering
+
+These examples are intended to illustrate increasing structural signal. For the last transaction in each example:
+* **Example 1** should receive the lowest risk score of the five.
+* **Example 4** should receive a meaningfully higher risk score than **Example 2**.
+* **Example 5** should receive a meaningfully higher risk score than **Example 4**. Two independent return paths converging on the same node represent a stronger structural signal than a single return.
+
+### Phase 1 Diagnostics Vocabulary
+
+Phase 1 evaluations can emit the following observation categories:
+* **`STRUCTURAL_DEVIATION`**: Disagreement detected in the evaluation of structural signals.
+* **`TEMPORAL_DEVIATION`**: Disagreement detected in temporal signal evaluation or lookback window handling.
+
+---
+
 ## Phase 2 Briefing
 
 Coordinated financial networks often share underlying infrastructure. Transactions that look unrelated on the graph may share a network address or device — a hint of common control.
@@ -281,7 +398,7 @@ These examples illustrate how identity observations change the available evidenc
 
 ---
 
-## Phase 2 Diagnostics Vocabulary
+## Diagnostics Vocabulary
 
 Phase 2 evaluations can emit the following observation categories:
 
