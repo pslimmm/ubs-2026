@@ -70,7 +70,8 @@ class ShowdownTests(unittest.TestCase):
 
     def test_learned_phase_two_rules(self):
         self.assertEqual(game.compare_hands(13, 8, 8, "verdigris"), -1)
-        self.assertEqual(game.compare_hands(6, 5, 13, "cinnabar"), -1)
+        self.assertEqual(game.compare_hands(6, 5, 5, "cinnabar"), -1)
+        self.assertEqual(game.compare_hands(6, 5, 13, "cinnabar"), 1)
         self.assertEqual(game.compare_hands(7, 13, 1, "amaranth"), 1)
         self.assertEqual(game.compare_hands(2, 12, 7, "obsidian"), 1)
 
@@ -171,6 +172,26 @@ class ShowdownTests(unittest.TestCase):
         response = self.client.post(
             "/move",
             json=payload(hand_number=39, players=players),
+        )
+
+        self.assertEqual(response.get_json(), {"action": "fold"})
+
+    def test_secured_leg_uses_exact_future_blinds(self):
+        response = self.client.post(
+            "/move",
+            json=payload(
+                table_rule="standard",
+                your_number=13,
+                community_number=13,
+                hand_number=38,
+                total_hands=40,
+                your_seat=0,
+                button_seat=0,
+                small_blind=1,
+                big_blind=2,
+                starting_stack=200,
+                your_stack=228,
+            ),
         )
 
         self.assertEqual(response.get_json(), {"action": "fold"})

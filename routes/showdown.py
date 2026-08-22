@@ -131,7 +131,7 @@ MODELS = tuple(
 STANDARD_MODEL = ("pair", 1, 1)
 KNOWN_MODELS = {
     "verdigris": STANDARD_MODEL,
-    "cinnabar": ("number_6", -1, 1),
+    "cinnabar": STANDARD_MODEL,
     "amaranth": ("number_7", 1, 1),
     "obsidian": ("card", -1, 0),
 }
@@ -205,6 +205,19 @@ def _amount_bounds(data: dict) -> tuple[int, int] | None:
     return (low, high) if 0 <= low <= high else None
 
 
+def _future_blind_cost(data: dict) -> float:
+    remaining = max(data.get("total_hands", 0) - data.get("hand_number", 0), 0)
+    seat, button = data.get("your_seat"), data.get("button_seat")
+    small, big = data.get("small_blind", 1), data.get("big_blind", 2)
+    if not all(isinstance(value, (int, float))
+               for value in (seat, button, small, big)):
+        return big * remaining if isinstance(big, (int, float)) else 2 * remaining
+    return sum(
+        small if seat == (button + offset) % 2 else big
+        for offset in range(1, remaining + 1)
+    )
+
+
 def _secured(data: dict) -> bool:
     target = {1: 10, 2: 25}.get(data.get("phase"))
     if target is None:
@@ -216,9 +229,8 @@ def _secured(data: dict) -> bool:
     stack, starting = data.get("your_stack"), data.get("starting_stack")
     if isinstance(stack, (int, float)) and isinstance(starting, (int, float)):
         delta = stack - starting
-    remaining = max(data.get("total_hands", 0) - data.get("hand_number", 0), 0)
-    blind = data.get("big_blind", 2)
-    return isinstance(delta, (int, float)) and delta >= target + blind * remaining
+    return (isinstance(delta, (int, float))
+            and delta >= target + _future_blind_cost(data))
 
 
 def _opponent_aggressive(data: dict) -> bool:
