@@ -132,7 +132,10 @@ class GraphRiskEngine:
     def _advance_window(self, timestamp: datetime) -> datetime:
         self.latest_time = max(self.latest_time or timestamp, timestamp)
         cutoff = self.latest_time - self.lookback
-        while self.history and self.history[0][0] <= cutoff:
+        # The active window is inclusive: a transaction exactly 24 hours old
+        # is still within the most recent 24 hours. It expires once it is
+        # strictly older than the cutoff.
+        while self.history and self.history[0][0] < cutoff:
             _, _, expired = heapq.heappop(self.history)
             self._remove_active(expired)
         self.nodes = set(self.adj) | {
@@ -297,7 +300,7 @@ class GraphRiskEngine:
 
         cutoff = self._advance_window(tx.timestamp)
         score = self._score(tx)
-        if tx.timestamp > cutoff:
+        if tx.timestamp >= cutoff:
             self._add_active(tx)
         self.processed_txs[tx.tx_id] = (tx.signature, score)
         return score

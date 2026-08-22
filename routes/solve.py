@@ -2,13 +2,14 @@ import base64
 import json
 import logging
 import math
+from typing import Any
 
 from flask import jsonify, request
 
 from routes import app
 
 logger = logging.getLogger(__name__)
-PRIORITIES = {"LOW": 1, "MEDIUM": 2, "HIGH": 3}
+PRIORITIES = {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
 
 
 def decode_payload(encoded_payload):
@@ -37,12 +38,16 @@ def adapt_output(adapt_input):
 
 
 def slo_output(heartbeats, query):
+    if not heartbeats:
+        return {"availability": 0, "p95LatencyMs": 0}
+
     matching = [
         heartbeat
         for heartbeat in heartbeats
         if heartbeat["service"] == query["service"]
         and heartbeat["timestamp"] >= query["since"]
     ]
+
     if not matching:
         return {"availability": 0, "p95LatencyMs": 0}
 
@@ -78,13 +83,10 @@ def solve():
         decoded_payload = decode_payload(data["payload"])
         result = {"adaptOutput": adapt_output(decoded_payload["adaptInput"])}
 
-        has_heartbeats = "heartbeats" in decoded_payload
         has_query = "sloQuery" in decoded_payload
-        if has_heartbeats != has_query:
-            raise ValueError("heartbeats and sloQuery must be provided together")
-        if has_heartbeats:
+        if has_query:
             result["sloOutput"] = slo_output(
-                decoded_payload["heartbeats"], decoded_payload["sloQuery"]
+                decoded_payload.get("heartbeats", None), decoded_payload["sloQuery"]
             )
     except (AttributeError, KeyError, TypeError, UnicodeDecodeError, ValueError) as error:
         logging.warning("invalid adaptation request: %s", error)
