@@ -47,10 +47,7 @@ class Label:
     holdings: tuple
     actions: tuple
 
-
-@app.route("/stonks", methods=["POST"])
-def stonks():
-    case = request.get_json(silent=True)
+def stonks(case):
     logger.info(
         "stonks request remote=%s content_length=%s cases=%s",
         request.remote_addr,
