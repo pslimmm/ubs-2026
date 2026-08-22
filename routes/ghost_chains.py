@@ -1,4 +1,5 @@
 import heapq
+import logging
 import math
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
@@ -8,6 +9,9 @@ from typing import Dict, Optional, Set, Tuple
 from flask import jsonify, request
 
 from routes import app
+
+
+logger = logging.getLogger(__name__)
 
 
 BASELINE_RISK = 0.05
@@ -305,9 +309,23 @@ engine = GraphRiskEngine()
 @app.route("/ghost-chains/transactions", methods=["POST"])
 def evaluate_transactions():
     payload = request.get_json(silent=True)
+    logger.info(
+        "ghost-chains request method=%s path=%s payload=%s",
+        request.method,
+        request.path,
+        payload,
+    )
     items = payload.get("transactions") if isinstance(payload, dict) else None
     if not isinstance(items, list):
-        return jsonify({"error": "Missing 'transactions' array in payload"}), 400
+        response = {"error": "Missing 'transactions' array in payload"}
+        logger.warning(
+            "ghost-chains response method=%s path=%s status=%s payload=%s",
+            request.method,
+            request.path,
+            400,
+            response,
+        )
+        return jsonify(response), 400
 
     results = []
     for item in items:
@@ -315,16 +333,61 @@ def evaluate_transactions():
             tx = Transaction.from_dict(item)
             results.append({"txId": tx.tx_id, "riskScore": engine.process_transaction(tx)})
         except (AttributeError, KeyError, TypeError, ValueError) as error:
-            return jsonify({"error": f"Invalid transaction structure: {error}"}), 400
-    return jsonify({"transactions": results}), 200
+            response = {"error": f"Invalid transaction structure: {error}"}
+            logger.warning(
+                "ghost-chains response method=%s path=%s status=%s payload=%s",
+                request.method,
+                request.path,
+                400,
+                response,
+            )
+            return jsonify(response), 400
+
+    response = {"transactions": results}
+    logger.info(
+        "ghost-chains response method=%s path=%s status=%s payload=%s",
+        request.method,
+        request.path,
+        200,
+        response,
+    )
+    return jsonify(response), 200
 
 
 @app.route("/ghost-chains/reset", methods=["POST"])
 def reset_state():
+    logger.info(
+        "ghost-chains request method=%s path=%s payload=%s",
+        request.method,
+        request.path,
+        request.get_json(silent=True),
+    )
     engine.reset()
-    return jsonify({"clearTransactions": True}), 200
+    response = {"clearTransactions": True}
+    logger.info(
+        "ghost-chains response method=%s path=%s status=%s payload=%s",
+        request.method,
+        request.path,
+        200,
+        response,
+    )
+    return jsonify(response), 200
 
 
 @app.route("/ghost-chains/health", methods=["GET"])
 def check_health():
-    return jsonify({"status": "ok"}), 200
+    logger.info(
+        "ghost-chains request method=%s path=%s payload=%s",
+        request.method,
+        request.path,
+        None,
+    )
+    response = {"status": "ok"}
+    logger.info(
+        "ghost-chains response method=%s path=%s status=%s payload=%s",
+        request.method,
+        request.path,
+        200,
+        response,
+    )
+    return jsonify(response), 200
