@@ -1,6 +1,5 @@
 import heapq
 import logging
-import math
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -14,12 +13,6 @@ from routes import app
 logger = logging.getLogger(__name__)
 
 
-BASELINE_RISK = 0.05
-RETURN_PATH_WEIGHT = 2.0
-# Keep structural growth distinguishable across a busy graph. A smaller value
-# makes broad reachability saturate too quickly and turns ordinary later
-# transactions into near-certain risk scores.
-SATURATION_SCALE = 12.0
 IDENTITY_CONNECTED_WEIGHT = 0.16
 IDENTITY_DISCONNECTED_WEIGHT = 0.05
 IDENTITY_DIVERGENCE_WEIGHT = 0.10
@@ -201,32 +194,29 @@ class GraphRiskEngine:
         return count
 
     def _structural_score(self, source: str, target: str) -> float:
-        upstream = self._reachable(source, self.rev) | {source}
-        downstream = self._reachable(target, self.adj) | {target}
-        route_pairs = len(upstream) * len(downstream)
-        parallel_edges = self.adj.get(source, {}).get(target, 0)
-
-        if parallel_edges:
-            impact = math.log2(1 + parallel_edges)
-        else:
-            alternative_origins = upstream & self._reachable(target, self.rev)
-            alternative_pairs = len(alternative_origins) * len(downstream)
-            impact = math.log2(route_pairs) + math.log2(1 + alternative_pairs)
-
-            old_distance = self._shortest_path(source, target)
-            if old_distance and old_distance > 1:
-                impact += (1 - 1 / old_distance) * math.log2(1 + route_pairs)
-
         if source == target:
-            impact += RETURN_PATH_WEIGHT
-        else:
-            return_distance = self._shortest_path(target, source)
-            if return_distance:
-                return_paths = self._count_disjoint_paths(target, source)
-                impact += RETURN_PATH_WEIGHT * return_paths / return_distance
+            return 0.8
 
-        score = 1 - (1 - BASELINE_RISK) * math.exp(-impact / SATURATION_SCALE)
-        return round(score, 4)
+        return_distance = self._shortest_path(target, source)
+        common_origins = len(
+            self._reachable(source, self.rev) & self._reachable(target, self.rev)
+        )
+
+        if return_distance:
+            return_paths = self._count_disjoint_paths(target, source)
+            signal = (
+                0.58
+                + 0.10 / return_distance
+                + 0.08 * min(common_origins, 3)
+                + 0.08 * min(return_paths - 1, 2)
+            )
+        elif common_origins:
+            signal = 0.32 + 0.06 * min(common_origins, 3)
+        elif source in self.nodes or target in self.nodes:
+            signal = 0.18
+        else:
+            signal = 0.05
+        return round(min(signal, 1.0), 4)
 
     def _identity_score(self, tx: Transaction) -> float:
         """Return bounded identity evidence from the active graph.
