@@ -41,9 +41,11 @@ def slo_output(heartbeats, query):
     if not heartbeats:
         return {"availability": 0, "p95LatencyMs": 0}
 
+    unique_heartbeats = [dict(t) for t in {tuple(d.items()) for d in heartbeats}]
+
     matching = [
         heartbeat
-        for heartbeat in heartbeats
+        for heartbeat in unique_heartbeats
         if heartbeat["service"] == query["service"]
         and heartbeat["timestamp"] >= query["since"]
     ]
