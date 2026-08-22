@@ -11,6 +11,10 @@ MEMORY_FILE = os.getenv("SHOWDOWN_MEMORY_FILE", "table_rules_memory.json")
 CARDS = range(1, 14)
 PRIMES = {2, 3, 5, 7, 11, 13}
 NUMBER_METRICS = tuple(f"number_{card}" for card in CARDS)
+VALUE_EQUITY = 0.70
+BET_EQUITY = 0.60
+NUT_EQUITY = 12.5 / 13
+MAX_CALL_BLINDS = 5
 
 
 def load_memory() -> dict:
@@ -216,18 +220,19 @@ def _secured(data: dict) -> bool:
     return isinstance(delta, (int, float)) and delta >= target + blind * remaining
 
 
-def _facing_reraise(data: dict) -> bool:
-    """Whether the opponent raised after our aggression in this round."""
-    our_seat = data.get("your_seat")
-    aggressive = False
-    for action in data.get("current_hand_actions", []):
-        if action.get("round") != data.get("round"):
-            continue
-        if action.get("seat") == our_seat:
-            aggressive |= action.get("action") in ("bet", "raise")
-        elif aggressive and action.get("action") == "raise":
-            return True
-    return False
+def _opponent_aggressive(data: dict) -> bool:
+    """Whether the opponent has bet or raised in the current round."""
+    our_seat = str(data.get("your_seat"))
+    actions = data.get("current_hand_actions", [])
+    if not isinstance(actions, list):
+        return False
+    return any(
+        isinstance(action, dict)
+        and action.get("round") == data.get("round")
+        and str(action.get("seat")) != our_seat
+        and action.get("action") in ("bet", "raise")
+        for action in actions
+    )
 
 
 def _move(data: dict) -> dict:
@@ -241,26 +246,29 @@ def _move(data: dict) -> dict:
         data.get("your_number"), data.get("community_number"),
         data.get("table_rule", "standard"),
     )
-    if _facing_reraise(data):
-        if equity >= 0.90 and "call" in legal:
+    to_call, pot = data.get("to_call", 0), data.get("pot", 0)
+    to_call = to_call if isinstance(to_call, (int, float)) and to_call > 0 else 0
+    pot = pot if isinstance(pot, (int, float)) and pot >= 0 else 0
+    blind = data.get("big_blind", 2)
+    blind = blind if isinstance(blind, (int, float)) and blind > 0 else 2
+    opponent_aggressive = _opponent_aggressive(data)
+    bounds = _amount_bounds(data)
+    if (equity >= VALUE_EQUITY and to_call <= blind and not opponent_aggressive
+            and "raise" in legal and bounds):
+        return {"action": "raise", "amount": bounds[0]}
+
+    if to_call:
+        pot_odds = to_call / (pot + to_call)
+        required = max(pot_odds, VALUE_EQUITY if opponent_aggressive else 0)
+        if "call" in legal and (
+                equity >= NUT_EQUITY
+                or (to_call <= blind * MAX_CALL_BLINDS and equity >= required)):
             return {"action": "call"}
         if "fold" in legal:
             return {"action": "fold"}
 
-    bounds = _amount_bounds(data)
-    if equity > 0.70 and "raise" in legal and bounds:
-        low, high = bounds
-        amount = int(low + (high - low) * min(equity - 0.70, 0.30))
-        return {"action": "raise", "amount": max(low, min(amount, high))}
-    if equity > 0.55 and "bet" in legal and bounds:
+    if equity >= BET_EQUITY and "bet" in legal and bounds:
         return {"action": "bet", "amount": bounds[0]}
-
-    to_call, pot = data.get("to_call", 0), data.get("pot", 0)
-    if not isinstance(to_call, (int, float)) or not isinstance(pot, (int, float)):
-        to_call = pot = 0
-    pot_odds = to_call / (pot + to_call) if pot + to_call > 0 else 0
-    if "call" in legal and equity >= pot_odds:
-        return {"action": "call"}
     for action in ("check", "fold", "call"):
         if action in legal:
             return {"action": action}

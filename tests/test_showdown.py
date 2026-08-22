@@ -183,6 +183,109 @@ class ShowdownTests(unittest.TestCase):
 
         self.assertEqual(response.get_json()["action"], "raise")
 
+    def test_raises_only_to_the_legal_minimum(self):
+        response = self.client.post(
+            "/move",
+            json=payload(
+                table_rule="standard",
+                your_number=13,
+                community_number=None,
+                to_call=1,
+                pot=3,
+                min_raise_to=5,
+                max_raise_to=200,
+                current_hand_actions=[],
+            ),
+        )
+
+        self.assertEqual(response.get_json(), {"action": "raise", "amount": 5})
+
+    def test_large_amaranth_call_folds_without_action_history(self):
+        response = self.client.post(
+            "/move",
+            json=payload(
+                table_rule="amaranth",
+                your_number=9,
+                community_number=None,
+                to_call=86,
+                pot=314,
+                min_raise_to=207,
+                max_raise_to=207,
+                current_hand_actions=[],
+            ),
+        )
+
+        self.assertEqual(response.get_json(), {"action": "fold"})
+
+    def test_large_cinnabar_call_folds_without_action_history(self):
+        response = self.client.post(
+            "/move",
+            json=payload(
+                table_rule="cinnabar",
+                your_number=11,
+                community_number=None,
+                to_call=104,
+                pot=248,
+                current_hand_actions=[],
+            ),
+        )
+
+        self.assertEqual(response.get_json(), {"action": "fold"})
+
+    def test_large_obsidian_call_folds_without_action_history(self):
+        response = self.client.post(
+            "/move",
+            json=payload(
+                table_rule="obsidian",
+                your_number=4,
+                community_number=None,
+                to_call=122,
+                pot=276,
+                current_hand_actions=[],
+            ),
+        )
+
+        self.assertEqual(response.get_json(), {"action": "fold"})
+
+    def test_never_reraises_opponent_aggression(self):
+        response = self.client.post(
+            "/move",
+            json=payload(
+                table_rule="standard",
+                your_number=12,
+                community_number=None,
+                to_call=3,
+                pot=7,
+                min_raise_to=9,
+                round="pre_reveal",
+                current_hand_actions=[
+                    {
+                        "round": "pre_reveal",
+                        "seat": 1,
+                        "action": "raise",
+                        "amount": 5,
+                    }
+                ],
+            ),
+        )
+
+        self.assertEqual(response.get_json(), {"action": "call"})
+
+    def test_nut_hand_may_call_a_large_wager(self):
+        response = self.client.post(
+            "/move",
+            json=payload(
+                table_rule="obsidian",
+                your_number=1,
+                community_number=8,
+                to_call=100,
+                pot=200,
+                current_hand_actions=[],
+            ),
+        )
+
+        self.assertEqual(response.get_json(), {"action": "call"})
+
     def test_folds_cinnabar_hand_after_opponent_reraises(self):
         evidence = [
             showdown_hand(1, 5, 6, 12, winner=12),
