@@ -13,7 +13,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = Flask(__name__)
 MEMORY_FILE = "rule_hypotheses.json"
 
 # Rule evaluator functions
