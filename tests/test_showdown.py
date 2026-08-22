@@ -213,22 +213,98 @@ class ShowdownTests(unittest.TestCase):
 
         self.assertEqual(response.get_json()["action"], "raise")
 
-    def test_raises_only_to_the_legal_minimum(self):
+    def test_pre_reveal_value_raise_uses_five(self):
         response = self.client.post(
             "/move",
             json=payload(
                 table_rule="standard",
-                your_number=13,
+                round="pre_reveal",
+                your_number=10,
                 community_number=None,
                 to_call=1,
                 pot=3,
-                min_raise_to=5,
+                min_raise_to=4,
                 max_raise_to=200,
                 current_hand_actions=[],
             ),
         )
 
         self.assertEqual(response.get_json(), {"action": "raise", "amount": 5})
+
+    def test_two_thirds_pot_value_sizing(self):
+        for pot, expected in ((4, 3), (10, 7), (20, 13)):
+            with self.subTest(pot=pot):
+                response = self.client.post(
+                    "/move",
+                    json=payload(
+                        table_rule="standard",
+                        round="post_reveal",
+                        your_number=10,
+                        community_number=1,
+                        to_call=0,
+                        pot=pot,
+                        legal_actions=["check", "bet"],
+                        min_raise_to=2,
+                        max_raise_to=200,
+                        current_hand_actions=[],
+                    ),
+                )
+
+                self.assertEqual(
+                    response.get_json(), {"action": "bet", "amount": expected}
+                )
+
+    def test_amaranth_hand_one_folds_to_opponent_reraise(self):
+        response = self.client.post(
+            "/move",
+            json=payload(
+                table_rule="amaranth",
+                round="pre_reveal",
+                your_number=11,
+                community_number=None,
+                to_call=6,
+                pot=14,
+                min_raise_to=16,
+                max_raise_to=200,
+                current_hand_actions=[
+                    {
+                        "round": "pre_reveal",
+                        "seat": 0,
+                        "action": "raise",
+                        "amount": 4,
+                    },
+                    {
+                        "round": "pre_reveal",
+                        "seat": 1,
+                        "action": "raise",
+                        "amount": 10,
+                    },
+                ],
+            ),
+        )
+
+        self.assertEqual(response.get_json(), {"action": "fold"})
+
+    def test_checked_to_steal_uses_minimum(self):
+        response = self.client.post(
+            "/move",
+            json=payload(
+                table_rule="standard",
+                round="post_reveal",
+                your_number=6,
+                community_number=13,
+                to_call=0,
+                pot=10,
+                legal_actions=["check", "bet"],
+                min_raise_to=2,
+                max_raise_to=200,
+                current_hand_actions=[
+                    {"round": "post_reveal", "seat": 1, "action": "check"}
+                ],
+            ),
+        )
+
+        self.assertEqual(response.get_json(), {"action": "bet", "amount": 2})
 
     def test_large_amaranth_call_folds_without_action_history(self):
         response = self.client.post(

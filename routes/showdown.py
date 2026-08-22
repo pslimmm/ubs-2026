@@ -11,10 +11,11 @@ MEMORY_FILE = os.getenv("SHOWDOWN_MEMORY_FILE", "table_rules_memory.json")
 CARDS = range(1, 14)
 PRIMES = {2, 3, 5, 7, 11, 13}
 NUMBER_METRICS = tuple(f"number_{card}" for card in CARDS)
-VALUE_EQUITY = 0.70
-BET_EQUITY = 0.60
+OPEN_EQUITY = 0.60
+CALL_EQUITY = 0.80
+STEAL_EQUITY = 0.35
 NUT_EQUITY = 12.5 / 13
-MAX_CALL_BLINDS = 5
+MAX_CALL_BLINDS = 10
 STRATEGY_VERSION = "phase1-2-v3"
 
 
@@ -233,19 +234,52 @@ def _secured(data: dict) -> bool:
             and delta >= target + _future_blind_cost(data))
 
 
-def _opponent_aggressive(data: dict) -> bool:
-    """Whether the opponent has bet or raised in the current round."""
-    our_seat = str(data.get("your_seat"))
+def _current_actions(data: dict) -> tuple[dict, ...]:
     actions = data.get("current_hand_actions", [])
     if not isinstance(actions, list):
-        return False
-    return any(
-        isinstance(action, dict)
-        and action.get("round") == data.get("round")
-        and str(action.get("seat")) != our_seat
-        and action.get("action") in ("bet", "raise")
-        for action in actions
+        return ()
+    return tuple(
+        action for action in actions
+        if isinstance(action, dict) and action.get("round") == data.get("round")
     )
+
+
+def _opponent_aggressive(data: dict) -> bool:
+    our_seat = str(data.get("your_seat"))
+    return any(
+        str(action.get("seat")) != our_seat
+        and action.get("action") in ("bet", "raise")
+        for action in _current_actions(data)
+    )
+
+
+def _opponent_checked(data: dict) -> bool:
+    our_seat = str(data.get("your_seat"))
+    return any(
+        str(action.get("seat")) != our_seat and action.get("action") == "check"
+        for action in _current_actions(data)
+    )
+
+
+def _opponent_reraised(data: dict) -> bool:
+    our_seat = str(data.get("your_seat"))
+    our_wager = False
+    for action in _current_actions(data):
+        if str(action.get("seat")) == our_seat:
+            our_wager |= action.get("action") in ("bet", "raise")
+        elif our_wager and action.get("action") == "raise":
+            return True
+    return False
+
+
+def _wager_amount(data: dict, bounds: tuple[int, int]) -> int:
+    blind = data.get("big_blind", 2)
+    blind = blind if isinstance(blind, (int, float)) and blind > 0 else 2
+    pot = data.get("pot", 0)
+    pot = pot if isinstance(pot, (int, float)) and pot >= 0 else 0
+    target = (round(2.5 * blind) if data.get("round") == "pre_reveal"
+              else round(2 * pot / 3))
+    return max(bounds[0], min(target, bounds[1]))
 
 
 def _move(data: dict) -> dict:
@@ -266,13 +300,20 @@ def _move(data: dict) -> dict:
     blind = blind if isinstance(blind, (int, float)) and blind > 0 else 2
     opponent_aggressive = _opponent_aggressive(data)
     bounds = _amount_bounds(data)
-    if (equity >= VALUE_EQUITY and to_call <= blind and not opponent_aggressive
+    if _opponent_reraised(data):
+        if equity >= NUT_EQUITY and "call" in legal:
+            return {"action": "call"}
+        if "fold" in legal:
+            return {"action": "fold"}
+
+    if (equity >= OPEN_EQUITY and to_call <= blind and not opponent_aggressive
             and "raise" in legal and bounds):
-        return {"action": "raise", "amount": bounds[0]}
+        return {"action": "raise", "amount": _wager_amount(data, bounds)}
 
     if to_call:
         pot_odds = to_call / (pot + to_call)
-        required = max(pot_odds, VALUE_EQUITY if opponent_aggressive else 0)
+        facing_wager = opponent_aggressive or to_call > blind
+        required = max(pot_odds, CALL_EQUITY if facing_wager else 0)
         if "call" in legal and (
                 equity >= NUT_EQUITY
                 or (to_call <= blind * MAX_CALL_BLINDS and equity >= required)):
@@ -280,8 +321,11 @@ def _move(data: dict) -> dict:
         if "fold" in legal:
             return {"action": "fold"}
 
-    if equity >= BET_EQUITY and "bet" in legal and bounds:
-        return {"action": "bet", "amount": bounds[0]}
+    if "bet" in legal and bounds:
+        if _opponent_checked(data) and equity >= STEAL_EQUITY:
+            return {"action": "bet", "amount": bounds[0]}
+        if equity >= OPEN_EQUITY:
+            return {"action": "bet", "amount": _wager_amount(data, bounds)}
     for action in ("check", "fold", "call"):
         if action in legal:
             return {"action": action}
